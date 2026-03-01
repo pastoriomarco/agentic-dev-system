@@ -35,6 +35,8 @@ Edit `.env` with real values:
 - `ALLOWED_REPOS` (recommended for multi-repo safety)
 - `MAX_RETRIES`, `RETRY_BASE_DELAY_SECONDS`, `RETRY_MAX_DELAY_SECONDS`, `RETRY_POLL_INTERVAL_SECONDS`
 - `WORKER_*` limits (CPU/memory/pids/timeout/image/network)
+- `AGENT_*` controls for changed-file policy, diff policy, and quality gates
+- `AGENT_PERMISSIONS_FILE` for explicit runtime permission context
 
 Start:
 
@@ -130,6 +132,9 @@ Queue key format:
 - Each approved issue runs inside a short-lived worker container with:
 : read-only root filesystem, dropped Linux caps, no-new-privileges, CPU/memory/pids limits, dedicated per-task workspace volume.
 - Worker containers are destroyed after execution; workspace volume is removed; artifacts/logs are retained.
+- The orchestrator now performs repo-aware edits through LLM-generated file operations.
+- Commit is blocked unless quality gates pass and policy checks pass (changed file count, diff size, forbidden paths).
+- Agent permissions are explicitly provided from `AGENT_PERMISSIONS.md` and injected into LLM system prompts.
 
 ## Practical deployment suggestions
 
@@ -142,15 +147,17 @@ Queue key format:
 : Example: `ALLOWED_REPOS=pastoriomarco/agentic-dev-system,pastoriomarco/private-repo`
 - This design requires Docker socket access by the webhook service.
 : Treat that host as privileged infrastructure and isolate it from untrusted multi-tenant workloads.
+- Worker internet egress is restricted through Squid proxy allowlist (`proxy/squid.conf`), defaulting to GitHub domains.
+: To allow extra destinations (for example remote LLM APIs), update `proxy/squid.conf` explicitly.
 
 ## Current limitations
 
-- Code generation is currently deterministic scaffolding in `agentic_changes/issue_<n>.md`.
-- Worker networking is still broad (`bridge`) by default; tighten egress with host firewall/network policies if needed.
+- LLM-generated edits can still fail on complex repos or ambiguous requirements; add repository-specific prompts/rules to improve reliability.
+- Domain-level allowlisting cannot guarantee single-repo access by itself; enforce single-repo scope with GitHub App/fine-grained token permissions.
 
 ## Next hardening steps
 
 - Add durable SQL state for audit/reporting (Postgres) alongside Redis operational state.
-- Add policy checks before PR creation.
-- Add path-level restrictions and policy engine for modified files.
+- Add semantic validation step (for example AST/static checks) before commit.
+- Add repository-specific policy bundles for path rules and mandatory quality commands.
 - Add integration tests for webhook event fixtures.

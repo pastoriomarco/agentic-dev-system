@@ -6,6 +6,7 @@ services:
     user: "0:0"
     depends_on:
       - redis
+      - egress-proxy
     env_file:
       - .env
     environment:
@@ -21,8 +22,16 @@ services:
       - RETRY_BASE_DELAY_SECONDS=${RETRY_BASE_DELAY_SECONDS:-60}
       - RETRY_MAX_DELAY_SECONDS=${RETRY_MAX_DELAY_SECONDS:-1800}
       - RETRY_POLL_INTERVAL_SECONDS=${RETRY_POLL_INTERVAL_SECONDS:-15}
+      - AGENT_MAX_CHANGED_FILES=${AGENT_MAX_CHANGED_FILES:-20}
+      - AGENT_MAX_DIFF_LINES=${AGENT_MAX_DIFF_LINES:-1500}
+      - AGENT_ALLOWED_PATH_PREFIXES=${AGENT_ALLOWED_PATH_PREFIXES:-}
+      - AGENT_FORBIDDEN_PATH_PREFIXES=${AGENT_FORBIDDEN_PATH_PREFIXES:-.git/,.github/workflows/,.env,secrets/}
+      - AGENT_QUALITY_COMMANDS=${AGENT_QUALITY_COMMANDS:-}
+      - AGENT_QUALITY_TIMEOUT_SECONDS=${AGENT_QUALITY_TIMEOUT_SECONDS:-600}
+      - AGENT_ALLOW_NO_QUALITY_GATES=${AGENT_ALLOW_NO_QUALITY_GATES:-false}
+      - AGENT_PERMISSIONS_FILE=${AGENT_PERMISSIONS_FILE:-/app/AGENT_PERMISSIONS.md}
       - WORKER_IMAGE=${WORKER_IMAGE:-agentic-dev-system:latest}
-      - WORKER_NETWORK=${WORKER_NETWORK:-bridge}
+      - WORKER_NETWORK=${WORKER_NETWORK:-agent_worker_net}
       - WORKER_TIMEOUT_SECONDS=${WORKER_TIMEOUT_SECONDS:-1800}
       - WORKER_CPU_LIMIT=${WORKER_CPU_LIMIT:-1.0}
       - WORKER_MEMORY_LIMIT=${WORKER_MEMORY_LIMIT:-2g}
@@ -30,6 +39,9 @@ services:
       - WORKER_ARTIFACTS_DIR=${WORKER_ARTIFACTS_DIR:-/worker-artifacts}
       - WORKER_ARTIFACTS_VOLUME=${WORKER_ARTIFACTS_VOLUME:-worker-artifacts}
       - WORKER_VOLUME_PREFIX=${WORKER_VOLUME_PREFIX:-agent-task}
+      - WORKER_HTTP_PROXY=${WORKER_HTTP_PROXY:-http://egress-proxy:3128}
+      - WORKER_HTTPS_PROXY=${WORKER_HTTPS_PROXY:-http://egress-proxy:3128}
+      - WORKER_NO_PROXY=${WORKER_NO_PROXY:-localhost,127.0.0.1,egress-proxy,redis}
       - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:8080/v1/chat/completions}
       - LLM_MODEL=${LLM_MODEL:-qwen3-coder-next}
       - DATABASE_URL=${DATABASE_URL:-sqlite:///agent_queue.db}
@@ -40,6 +52,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - worker-artifacts:/worker-artifacts
     restart: unless-stopped
+    networks:
+      - app_net
 
   redis:
     image: redis:7-alpine
@@ -48,7 +62,25 @@ services:
     volumes:
       - redis-data:/data
     restart: unless-stopped
+    networks:
+      - app_net
+
+  egress-proxy:
+    image: ubuntu/squid:5.2-22.04_beta
+    container_name: agent-egress-proxy
+    volumes:
+      - ./proxy/squid.conf:/etc/squid/squid.conf:ro
+    restart: unless-stopped
+    networks:
+      - app_net
+      - worker_net
 
 volumes:
   redis-data:
   worker-artifacts:
+
+networks:
+  app_net:
+  worker_net:
+    name: agent_worker_net
+    internal: true

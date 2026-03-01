@@ -17,7 +17,6 @@ from typing import Any, Dict, List
 import httpx
 from docker import from_env as docker_from_env
 from docker.client import DockerClient
-from docker.errors import DockerException
 from docker.types import Mount
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -37,7 +36,7 @@ RETRY_MAX_DELAY_SECONDS = int(os.environ.get("RETRY_MAX_DELAY_SECONDS", "1800"))
 RETRY_POLL_INTERVAL_SECONDS = int(os.environ.get("RETRY_POLL_INTERVAL_SECONDS", "15"))
 
 WORKER_IMAGE = os.environ.get("WORKER_IMAGE", "agentic-dev-system:latest")
-WORKER_NETWORK = os.environ.get("WORKER_NETWORK", "bridge")
+WORKER_NETWORK = os.environ.get("WORKER_NETWORK", "agent_worker_net")
 WORKER_TIMEOUT_SECONDS = int(os.environ.get("WORKER_TIMEOUT_SECONDS", "1800"))
 WORKER_CPU_LIMIT = float(os.environ.get("WORKER_CPU_LIMIT", "1.0"))
 WORKER_MEMORY_LIMIT = os.environ.get("WORKER_MEMORY_LIMIT", "2g")
@@ -45,6 +44,9 @@ WORKER_PIDS_LIMIT = int(os.environ.get("WORKER_PIDS_LIMIT", "256"))
 WORKER_ARTIFACTS_DIR = Path(os.environ.get("WORKER_ARTIFACTS_DIR", "/worker-artifacts"))
 WORKER_ARTIFACTS_VOLUME = os.environ.get("WORKER_ARTIFACTS_VOLUME", "worker-artifacts")
 WORKER_VOLUME_PREFIX = os.environ.get("WORKER_VOLUME_PREFIX", "agent-task")
+WORKER_HTTP_PROXY = os.environ.get("WORKER_HTTP_PROXY", "http://egress-proxy:3128")
+WORKER_HTTPS_PROXY = os.environ.get("WORKER_HTTPS_PROXY", "http://egress-proxy:3128")
+WORKER_NO_PROXY = os.environ.get("WORKER_NO_PROXY", "localhost,127.0.0.1,egress-proxy,redis")
 
 app = FastAPI(title="Agent Webhook Handler")
 
@@ -273,6 +275,14 @@ def _run_worker_container(issue: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
             "GITHUB_BASE_BRANCH": os.environ.get("GITHUB_BASE_BRANCH", "main"),
             "LLM_API_URL": os.environ.get("LLM_API_URL", ""),
             "LLM_MODEL": os.environ.get("LLM_MODEL", ""),
+            "HTTP_PROXY": WORKER_HTTP_PROXY,
+            "HTTPS_PROXY": WORKER_HTTPS_PROXY,
+            "ALL_PROXY": WORKER_HTTPS_PROXY,
+            "NO_PROXY": WORKER_NO_PROXY,
+            "http_proxy": WORKER_HTTP_PROXY,
+            "https_proxy": WORKER_HTTPS_PROXY,
+            "all_proxy": WORKER_HTTPS_PROXY,
+            "no_proxy": WORKER_NO_PROXY,
         }
 
         container = client.containers.run(
