@@ -1,9 +1,9 @@
-version: "3.8"
-
 services:
   webhook:
     build: .
     container_name: agent-webhook
+    depends_on:
+      - redis
     env_file:
       - .env
     environment:
@@ -12,6 +12,9 @@ services:
       - GITHUB_OWNER=${GITHUB_OWNER}
       - GITHUB_REPO=${GITHUB_REPO}
       - GITHUB_BASE_BRANCH=${GITHUB_BASE_BRANCH:-main}
+      - ALLOWED_REPOS=${ALLOWED_REPOS:-}
+      - ADMIN_API_TOKEN=${ADMIN_API_TOKEN:-}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:8080/v1/chat/completions}
       - LLM_MODEL=${LLM_MODEL:-qwen3-coder-next}
       - DATABASE_URL=${DATABASE_URL:-sqlite:///agent_queue.db}
@@ -21,3 +24,14 @@ services:
       - ./workspace:/app/workspace
       - ./logs:/app/logs
     restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: agent-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:

@@ -1,104 +1,129 @@
-# AI Developer Agent System (MVP)
+# Agentic Dev System (MVP)
 
-This project is a runnable MVP for an agentic developer workflow:
+Webhook-driven agent workflow for GitHub issues and PR comments with mandatory human approval before execution.
 
-- Receives GitHub webhooks for issues/PRs/comments.
-- Queues work items for human approval.
-- Runs an agent in Docker after approval.
-- Creates a branch, commit, and PR in GitHub.
-- Keeps all merge decisions with humans.
+## What it does
 
-## What This MVP Includes
+- Receives GitHub webhook events.
+- Queues candidate work items.
+- Waits for explicit approval.
+- Runs one agent task at a time.
+- Creates branch, commit, push, and PR.
 
-- `webhook_handler.py`: FastAPI webhook + queue + approval API.
-- `agent_orchestrator.py`: Clone repo, create deterministic change artifact, commit, push, open PR.
-- `Dockerfile` + `docker-compose.yml`: containerized runtime.
-- In-memory queue/session storage (no Redis persistence yet).
+## Repository layout
 
-## Quick Start
+- Service repo: this project (`pastoriomarco/agentic-dev-system`).
+- Target repo: any repo that sends webhooks and is accessible with `GITHUB_TOKEN`.
 
-1. Configure environment:
+The service clones target repos into `workspace/` inside the container at execution time.
+
+## Quick setup (your current path)
 
 ```bash
-cd agentic-dev-system
+cd /home/tndlux/workspaces/isaac_ros-dev/src/agentic-dev-system
 cp .env.example .env
 ```
 
-2. Edit `.env`:
+Edit `.env` with real values:
 
-- Set `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO`.
-- Set `GITHUB_WEBHOOK_SECRET` to your webhook secret.
-- Optionally set `GITHUB_BASE_BRANCH` (default `main`).
+- `GITHUB_WEBHOOK_SECRET`
+- `GITHUB_TOKEN`
+- `GITHUB_OWNER`
+- `GITHUB_REPO`
+- `ADMIN_API_TOKEN` (recommended)
+- `REDIS_URL` (defaults to local compose Redis)
+- `ALLOWED_REPOS` (recommended for multi-repo safety)
 
-3. Start:
+Start:
 
 ```bash
 docker-compose up -d --build
 ```
 
-4. Configure GitHub webhook:
+## GitHub webhook setup
 
-- URL: `https://your-domain/webhook/github`
+In target repository settings:
+
+- Payload URL: `https://<public-host>/webhook/github`
 - Content type: `application/json`
-- Secret: same as `.env`
-- Events: `issues`, `pull_request`, `issue_comment`, `pull_request_review`, `pull_request_review_comment`
+- Secret: same value as `GITHUB_WEBHOOK_SECRET`
+- Events:
+- `issues`
+- `pull_request`
+- `issue_comment`
+- `pull_request_review`
+- `pull_request_review_comment`
 
-## API
+## API usage
 
-- Health:
+Health:
 
 ```bash
 curl http://localhost:8000/health
 ```
 
-- List queue:
+List queue:
 
 ```bash
 curl http://localhost:8000/api/issues
 ```
 
-- Approve and start agent:
+Approve (starts agent):
 
 ```bash
-curl -X POST http://localhost:8000/api/issues/{queue_key}/approve
+curl -X POST \
+  -H "X-Admin-Token: <ADMIN_API_TOKEN>" \
+  http://localhost:8000/api/issues/<queue_key>/approve
 ```
 
-- Reject:
+Reject:
 
 ```bash
-curl -X POST http://localhost:8000/api/issues/{queue_key}/reject
+curl -X POST \
+  -H "X-Admin-Token: <ADMIN_API_TOKEN>" \
+  http://localhost:8000/api/issues/<queue_key>/reject
 ```
 
-- Session results:
+List sessions:
 
 ```bash
 curl http://localhost:8000/api/sessions
 ```
 
-`queue_key` format is `owner:repo:issue_number` (example: `octocat:hello-world:42`).
+Queue key format:
 
-## Current Trigger Rules
+- `owner:repo:issue_number`
+- Example: `pastoriomarco:agentic-dev-system:12`
 
-Work is marked `auto` when title/body/comment contains one of:
+## Operational model
 
-- `@agent`
-- `@ai`
-- `fix this`
-- `implement`
-- `create`
+- `AGENT.md` defines agent behavior and quality/safety rules.
+- Only approved items are executed.
+- Execution is serialized through an internal lock (one task at a time).
+- Queue and session persistence are stored in Redis.
+- Webhooks are accepted only from allowlisted repos.
+: If `ALLOWED_REPOS` is empty, the service defaults to allowlisting `GITHUB_OWNER/GITHUB_REPO` when set.
 
-All items still require explicit approval through the API before execution.
+## Practical deployment suggestions
 
-## Current Agent Behavior
+- Run this service once (not once per target repo).
+- Use one dedicated bot token or GitHub App installation per org/project.
+- Keep this service on a stable host and expose `/webhook/github` using a reverse proxy.
+- If testing locally, tunnel with `cloudflared` or `ngrok`.
+- Restrict approval API access at network layer and with `ADMIN_API_TOKEN`.
+- Set `ALLOWED_REPOS` explicitly in production.
+: Example: `ALLOWED_REPOS=pastoriomarco/agentic-dev-system,pastoriomarco/private-repo`
 
-This MVP does not use autonomous code generation yet. It creates a deterministic artifact in the target repo:
+## Current limitations
 
-- `agentic_changes/issue_<number>.md`
+- No retry policy yet.
+- No sandboxing per task container yet.
+- Code generation is currently deterministic scaffolding in `agentic_changes/issue_<n>.md`.
 
-That guarantees a reproducible commit/PR flow while you integrate your LLM editing strategy.
+## Next hardening steps
 
-## Notes
-
-- Queue and sessions are in memory; restart clears state.
-- If `GITHUB_WEBHOOK_SECRET` is empty, signature validation is disabled.
-- For production, add persistent queue/state, retries, auth on approval endpoints, and least-privilege GitHub App auth.
+- Add durable SQL state for audit/reporting (Postgres) alongside Redis operational state.
+- Add retry/backoff and dead-letter queue.
+- Add policy checks before PR creation.
+- Add per-target-repo allowlist and path restrictions.
+- Add integration tests for webhook event fixtures.
