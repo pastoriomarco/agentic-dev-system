@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import quote
 
 import httpx
 from docker import from_env as docker_from_env
@@ -50,6 +51,16 @@ WORKER_NO_PROXY = os.environ.get("WORKER_NO_PROXY", "localhost,127.0.0.1,egress-
 DEEP_HEALTH_TIMEOUT_SECONDS = float(os.environ.get("DEEP_HEALTH_TIMEOUT_SECONDS", "8"))
 DEEP_HEALTH_GITHUB_URL = os.environ.get("DEEP_HEALTH_GITHUB_URL", "https://api.github.com/meta")
 DEEP_HEALTH_CHECK_LLM = os.environ.get("DEEP_HEALTH_CHECK_LLM", "false").lower() == "true"
+GITHUB_STATUS_LABELS_ENABLED = os.environ.get("GITHUB_STATUS_LABELS_ENABLED", "true").lower() == "true"
+GITHUB_STATUS_COMMENTS_ENABLED = os.environ.get("GITHUB_STATUS_COMMENTS_ENABLED", "true").lower() == "true"
+GITHUB_ASSIGN_ON_PROCESSING = os.environ.get("GITHUB_ASSIGN_ON_PROCESSING", "false").lower() == "true"
+GITHUB_ASSIGNEE_LOGIN = os.environ.get("GITHUB_ASSIGNEE_LOGIN", "").strip()
+LABEL_QUEUED = os.environ.get("GH_LABEL_QUEUED", "agent:queued")
+LABEL_IN_PROGRESS = os.environ.get("GH_LABEL_IN_PROGRESS", "agent:in-progress")
+LABEL_PR_OPENED = os.environ.get("GH_LABEL_PR_OPENED", "agent:pr-opened")
+LABEL_FAILED = os.environ.get("GH_LABEL_FAILED", "agent:failed")
+LABEL_DEAD_LETTER = os.environ.get("GH_LABEL_DEAD_LETTER", "agent:dead-letter")
+LABEL_REJECTED = os.environ.get("GH_LABEL_REJECTED", "agent:rejected")
 
 app = FastAPI(title="Agent Webhook Handler")
 
@@ -57,6 +68,7 @@ AGENT_RUN_LOCK = asyncio.Lock()
 redis_client: Redis | None = None
 docker_client: DockerClient | None = None
 retry_worker_task: asyncio.Task | None = None
+ensured_label_repos: set[str] = set()
 
 ISSUE_KEY_PREFIX = "issue:"
 SESSION_KEY_PREFIX = "session:"
@@ -64,6 +76,23 @@ ISSUE_INDEX_KEY = "issues:index"
 SESSION_INDEX_KEY = "sessions:index"
 RETRY_INDEX_KEY = "issues:retry:index"
 DEAD_LETTER_INDEX_KEY = "issues:dead_letter:index"
+
+ALL_AGENT_LABELS = [
+    LABEL_QUEUED,
+    LABEL_IN_PROGRESS,
+    LABEL_PR_OPENED,
+    LABEL_FAILED,
+    LABEL_DEAD_LETTER,
+    LABEL_REJECTED,
+]
+LABEL_COLORS = {
+    LABEL_QUEUED: "D4C5F9",
+    LABEL_IN_PROGRESS: "0E8A16",
+    LABEL_PR_OPENED: "1D76DB",
+    LABEL_FAILED: "B60205",
+    LABEL_DEAD_LETTER: "5319E7",
+    LABEL_REJECTED: "6A737D",
+}
 
 
 def now_utc() -> datetime:
@@ -199,6 +228,93 @@ async def verify_github_signature(request: Request, signature: str) -> bool:
     digest = hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
     expected = f"sha256={digest}"
     return hmac.compare_digest(signature, expected)
+
+
+def _split_owner_repo(repo_full_name: str) -> tuple[str, str]:
+    parts = repo_full_name.split("/")
+    if len(parts) != 2:
+        raise Exception(f"Invalid repo full name: {repo_full_name}")
+    return parts[0], parts[1]
+
+
+async def _github_api_request(method: str, repo_full_name: str, path: str, json_body: Dict[str, Any] | None = None) -> httpx.Response:
+    owner, repo = _split_owner_repo(repo_full_name)
+    url = f"https://api.github.com/repos/{owner}/{repo}{path}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.request(method, url, headers=headers, json=json_body)
+    return response
+
+
+def _status_label_for_issue_status(status: str) -> str:
+    mapping = {
+        "queued": LABEL_QUEUED,
+        "approved": LABEL_QUEUED,
+        "processing": LABEL_IN_PROGRESS,
+        "completed": LABEL_PR_OPENED,
+        "queued_retry": LABEL_FAILED,
+        "failed": LABEL_FAILED,
+        "dead_letter": LABEL_DEAD_LETTER,
+        "rejected": LABEL_REJECTED,
+    }
+    return mapping.get(status, LABEL_QUEUED)
+
+
+async def _ensure_repo_labels(repo_full_name: str) -> None:
+    if not GITHUB_TOKEN or not GITHUB_STATUS_LABELS_ENABLED:
+        return
+    if repo_full_name in ensured_label_repos:
+        return
+    for label_name in ALL_AGENT_LABELS:
+        response = await _github_api_request(
+            "POST",
+            repo_full_name,
+            "/labels",
+            {"name": label_name, "color": LABEL_COLORS.get(label_name, "6A737D"), "description": "Agent workflow status"},
+        )
+        # 201 created, 422 already exists; both acceptable.
+        if response.status_code not in (201, 422):
+            print(f"Warning: failed to ensure label '{label_name}' on {repo_full_name}: {response.status_code} {response.text[:200]}")
+    ensured_label_repos.add(repo_full_name)
+
+
+async def _set_issue_status_label(repo_full_name: str, issue_number: int, status: str) -> None:
+    if not GITHUB_TOKEN or not GITHUB_STATUS_LABELS_ENABLED:
+        return
+    await _ensure_repo_labels(repo_full_name)
+    for label in ALL_AGENT_LABELS:
+        encoded = quote(label, safe="")
+        response = await _github_api_request("DELETE", repo_full_name, f"/issues/{issue_number}/labels/{encoded}")
+        if response.status_code not in (200, 404):
+            print(f"Warning: failed deleting label {label} on {repo_full_name}#{issue_number}: {response.status_code}")
+    target = _status_label_for_issue_status(status)
+    response = await _github_api_request("POST", repo_full_name, f"/issues/{issue_number}/labels", {"labels": [target]})
+    if response.status_code not in (200, 201):
+        print(f"Warning: failed setting label {target} on {repo_full_name}#{issue_number}: {response.status_code} {response.text[:200]}")
+
+
+async def _post_issue_comment(repo_full_name: str, issue_number: int, body: str) -> None:
+    if not GITHUB_TOKEN or not GITHUB_STATUS_COMMENTS_ENABLED:
+        return
+    response = await _github_api_request("POST", repo_full_name, f"/issues/{issue_number}/comments", {"body": body})
+    if response.status_code not in (200, 201):
+        print(f"Warning: failed posting comment on {repo_full_name}#{issue_number}: {response.status_code} {response.text[:200]}")
+
+
+async def _assign_issue(repo_full_name: str, issue_number: int) -> None:
+    if not GITHUB_TOKEN or not GITHUB_ASSIGN_ON_PROCESSING or not GITHUB_ASSIGNEE_LOGIN:
+        return
+    response = await _github_api_request(
+        "POST",
+        repo_full_name,
+        f"/issues/{issue_number}/assignees",
+        {"assignees": [GITHUB_ASSIGNEE_LOGIN]},
+    )
+    if response.status_code not in (200, 201):
+        print(f"Warning: failed assigning {repo_full_name}#{issue_number} to {GITHUB_ASSIGNEE_LOGIN}: {response.status_code} {response.text[:200]}")
 
 
 async def notify_slack(event_type: str, issue_number: int, title: str) -> None:
@@ -342,6 +458,13 @@ async def run_agent_for_issue(queue_key: str) -> None:
         issue["started_at"] = now_utc().isoformat()
         issue["attempt_count"] = int(issue.get("attempt_count", 0)) + 1
         await store_issue(issue)
+        await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+        await _assign_issue(issue["repo_full_name"], issue["issue_number"])
+        await _post_issue_comment(
+            issue["repo_full_name"],
+            issue["issue_number"],
+            f"Agent started processing (attempt {issue['attempt_count']}). Session pending...",
+        )
 
         session_data, worker_logs = await asyncio.to_thread(_run_worker_container, issue)
         session_data.setdefault("session_id", str(uuid.uuid4()))
@@ -362,6 +485,19 @@ async def run_agent_for_issue(queue_key: str) -> None:
         if session_data.get("status") == "completed":
             issue["status"] = "completed"
             issue.pop("next_retry_at", None)
+            pr_url = issue.get("output_pr", {}).get("url")
+            if pr_url:
+                await _post_issue_comment(
+                    issue["repo_full_name"],
+                    issue["issue_number"],
+                    f"Agent completed successfully. PR created: {pr_url}",
+                )
+            else:
+                await _post_issue_comment(
+                    issue["repo_full_name"],
+                    issue["issue_number"],
+                    "Agent completed successfully.",
+                )
         else:
             errors = session_data.get("errors") or ["Agent run failed without explicit error message."]
             issue["errors"] = errors
@@ -373,10 +509,23 @@ async def run_agent_for_issue(queue_key: str) -> None:
                 retry_at = now_utc() + timedelta(seconds=delay_seconds)
                 issue["status"] = "queued_retry"
                 issue["next_retry_at"] = retry_at.isoformat()
+                await _post_issue_comment(
+                    issue["repo_full_name"],
+                    issue["issue_number"],
+                    f"Agent attempt {attempts_used} failed. Scheduled retry at {issue['next_retry_at']}. "
+                    f"Last error: {issue['last_error']}",
+                )
             else:
                 issue["status"] = "dead_letter"
                 issue["dead_lettered_at"] = now_utc().isoformat()
                 issue.pop("next_retry_at", None)
+                await _post_issue_comment(
+                    issue["repo_full_name"],
+                    issue["issue_number"],
+                    f"Agent moved this item to dead-letter after {attempts_used} attempts. "
+                    f"Last error: {issue['last_error']}",
+                )
+        await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
         await store_issue(issue)
 
 
@@ -398,6 +547,12 @@ async def retry_worker_loop() -> None:
                 issue["retried_at"] = now_utc().isoformat()
                 issue.pop("next_retry_at", None)
                 await store_issue(issue)
+                await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+                await _post_issue_comment(
+                    issue["repo_full_name"],
+                    issue["issue_number"],
+                    f"Automatic retry triggered at {issue['retried_at']}.",
+                )
                 asyncio.create_task(run_agent_for_issue(queue_key))
         except asyncio.CancelledError:
             raise
@@ -598,6 +753,7 @@ async def process_issue_event(event_type: str, payload: Dict[str, Any]) -> None:
             "output_pr": None,
         }
         await store_issue(issue)
+        await _set_issue_status_label(repo_full_name, issue_number, issue["status"])
         print(f"Queued {queue_key} ({event_type}, trigger={trigger_type})")
 
         if trigger_type == "auto":
@@ -636,6 +792,12 @@ async def approve_issue(
     issue["last_error"] = None
     issue.pop("dead_lettered_at", None)
     await store_issue(issue)
+    await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+    await _post_issue_comment(
+        issue["repo_full_name"],
+        issue["issue_number"],
+        "Issue approved for agent execution. Waiting for worker start.",
+    )
     background_tasks.add_task(run_agent_for_issue, queue_key)
     return {"status": "approved", "issue": issue}
 
@@ -653,6 +815,8 @@ async def reject_issue(
     issue["rejected_at"] = now_utc().isoformat()
     issue["next_retry_at"] = None
     await store_issue(issue)
+    await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+    await _post_issue_comment(issue["repo_full_name"], issue["issue_number"], "Issue rejected for agent execution.")
     return {"status": "rejected", "issue": issue}
 
 
@@ -681,6 +845,12 @@ async def requeue_issue(
     issue["last_error"] = None
     issue.pop("dead_lettered_at", None)
     await store_issue(issue)
+    await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+    await _post_issue_comment(
+        issue["repo_full_name"],
+        issue["issue_number"],
+        "Issue manually requeued for agent execution.",
+    )
     asyncio.create_task(run_agent_for_issue(queue_key))
     return {"status": "requeued", "issue": issue}
 

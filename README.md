@@ -31,6 +31,7 @@ Edit `.env` with real values:
 - `GITHUB_OWNER`
 - `GITHUB_REPO`
 - `ADMIN_API_TOKEN` (recommended)
+- `GITHUB_STATUS_*` and `GH_LABEL_*` for default GitHub-side ownership signaling
 - `REDIS_URL` (defaults to local compose Redis)
 - `ALLOWED_REPOS` (recommended for multi-repo safety)
 - `MAX_RETRIES`, `RETRY_BASE_DELAY_SECONDS`, `RETRY_MAX_DELAY_SECONDS`, `RETRY_POLL_INTERVAL_SECONDS`
@@ -141,6 +142,8 @@ Queue key format:
 - The orchestrator now performs repo-aware edits through LLM-generated file operations.
 - Commit is blocked unless quality gates pass and policy checks pass (changed file count, diff size, forbidden paths).
 - Agent permissions are explicitly provided from `AGENT_PERMISSIONS.md` and injected into LLM system prompts.
+- GitHub issue/PR status is signaled automatically via labels and comments (default labels):
+: `agent:queued`, `agent:in-progress`, `agent:pr-opened`, `agent:failed`, `agent:dead-letter`, `agent:rejected`
 
 ## Practical deployment suggestions
 
@@ -156,6 +159,7 @@ Queue key format:
 - Worker internet egress is restricted through Squid proxy allowlist (`proxy/squid.conf`), defaulting to GitHub domains.
 : To allow extra destinations (for example remote LLM APIs), update `proxy/squid.conf` explicitly.
 - Use `/health/deep` for preflight checks (Redis, Docker daemon, proxy->GitHub, optional LLM endpoint).
+- Optional auto-assignment is available (`GITHUB_ASSIGN_ON_PROCESSING=true` with `GITHUB_ASSIGNEE_LOGIN=<bot-user>`).
 
 ## Current limitations
 
