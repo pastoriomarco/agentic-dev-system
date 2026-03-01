@@ -47,6 +47,9 @@ WORKER_VOLUME_PREFIX = os.environ.get("WORKER_VOLUME_PREFIX", "agent-task")
 WORKER_HTTP_PROXY = os.environ.get("WORKER_HTTP_PROXY", "http://egress-proxy:3128")
 WORKER_HTTPS_PROXY = os.environ.get("WORKER_HTTPS_PROXY", "http://egress-proxy:3128")
 WORKER_NO_PROXY = os.environ.get("WORKER_NO_PROXY", "localhost,127.0.0.1,egress-proxy,redis")
+DEEP_HEALTH_TIMEOUT_SECONDS = float(os.environ.get("DEEP_HEALTH_TIMEOUT_SECONDS", "8"))
+DEEP_HEALTH_GITHUB_URL = os.environ.get("DEEP_HEALTH_GITHUB_URL", "https://api.github.com/meta")
+DEEP_HEALTH_CHECK_LLM = os.environ.get("DEEP_HEALTH_CHECK_LLM", "false").lower() == "true"
 
 app = FastAPI(title="Agent Webhook Handler")
 
@@ -409,6 +412,61 @@ async def health() -> Dict[str, str]:
     await redis.ping()
     await asyncio.to_thread(get_docker_client().ping)
     return {"status": "ok"}
+
+
+async def _check_http_url(
+    name: str,
+    url: str,
+    use_proxy: bool = False,
+    required: bool = True,
+) -> Dict[str, Any]:
+    proxies = None
+    if use_proxy:
+        proxies = {"http://": WORKER_HTTP_PROXY, "https://": WORKER_HTTPS_PROXY}
+    try:
+        async with httpx.AsyncClient(timeout=DEEP_HEALTH_TIMEOUT_SECONDS, proxies=proxies) as client:
+            response = await client.get(url)
+        return {"name": name, "ok": response.status_code < 500, "status_code": response.status_code, "url": url}
+    except Exception as exc:
+        return {"name": name, "ok": not required, "error": str(exc), "url": url, "required": required}
+
+
+@app.get("/health/deep")
+async def health_deep() -> JSONResponse:
+    checks: List[Dict[str, Any]] = []
+
+    # Core dependencies.
+    try:
+        redis = await get_redis()
+        await redis.ping()
+        checks.append({"name": "redis", "ok": True})
+    except Exception as exc:
+        checks.append({"name": "redis", "ok": False, "error": str(exc)})
+
+    try:
+        await asyncio.to_thread(get_docker_client().ping)
+        checks.append({"name": "docker_daemon", "ok": True})
+    except Exception as exc:
+        checks.append({"name": "docker_daemon", "ok": False, "error": str(exc)})
+
+    # Egress path through proxy to GitHub.
+    checks.append(await _check_http_url("proxy_to_github", DEEP_HEALTH_GITHUB_URL, use_proxy=True, required=True))
+
+    # Optional LLM endpoint check.
+    llm_url = os.environ.get("LLM_API_URL", "").strip()
+    if llm_url and DEEP_HEALTH_CHECK_LLM:
+        checks.append(await _check_http_url("llm_endpoint", llm_url, use_proxy=False, required=False))
+
+    ok = all(item.get("ok", False) for item in checks if item.get("required", True))
+    status_code = 200 if ok else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "ok" if ok else "degraded",
+            "checks": checks,
+            "timestamp": now_utc().isoformat(),
+        },
+    )
 
 
 @app.on_event("startup")

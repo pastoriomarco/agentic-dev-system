@@ -42,6 +42,9 @@ services:
       - WORKER_HTTP_PROXY=${WORKER_HTTP_PROXY:-http://egress-proxy:3128}
       - WORKER_HTTPS_PROXY=${WORKER_HTTPS_PROXY:-http://egress-proxy:3128}
       - WORKER_NO_PROXY=${WORKER_NO_PROXY:-localhost,127.0.0.1,egress-proxy,redis}
+      - DEEP_HEALTH_TIMEOUT_SECONDS=${DEEP_HEALTH_TIMEOUT_SECONDS:-8}
+      - DEEP_HEALTH_GITHUB_URL=${DEEP_HEALTH_GITHUB_URL:-https://api.github.com/meta}
+      - DEEP_HEALTH_CHECK_LLM=${DEEP_HEALTH_CHECK_LLM:-false}
       - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:8080/v1/chat/completions}
       - LLM_MODEL=${LLM_MODEL:-qwen3-coder-next}
       - DATABASE_URL=${DATABASE_URL:-sqlite:///agent_queue.db}

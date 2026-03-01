@@ -66,6 +66,12 @@ Health:
 curl http://localhost:8000/health
 ```
 
+Deep health (dependencies + proxy path):
+
+```bash
+curl http://localhost:8000/health/deep
+```
+
 List queue:
 
 ```bash
@@ -149,6 +155,7 @@ Queue key format:
 : Treat that host as privileged infrastructure and isolate it from untrusted multi-tenant workloads.
 - Worker internet egress is restricted through Squid proxy allowlist (`proxy/squid.conf`), defaulting to GitHub domains.
 : To allow extra destinations (for example remote LLM APIs), update `proxy/squid.conf` explicitly.
+- Use `/health/deep` for preflight checks (Redis, Docker daemon, proxy->GitHub, optional LLM endpoint).
 
 ## Current limitations
 
