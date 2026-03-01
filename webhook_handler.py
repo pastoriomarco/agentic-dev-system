@@ -8,7 +8,7 @@ import hmac
 import os
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
 import httpx
@@ -26,16 +26,23 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
 ALLOWED_REPOS_RAW = os.environ.get("ALLOWED_REPOS", "").strip()
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+RETRY_BASE_DELAY_SECONDS = int(os.environ.get("RETRY_BASE_DELAY_SECONDS", "60"))
+RETRY_MAX_DELAY_SECONDS = int(os.environ.get("RETRY_MAX_DELAY_SECONDS", "1800"))
+RETRY_POLL_INTERVAL_SECONDS = int(os.environ.get("RETRY_POLL_INTERVAL_SECONDS", "15"))
 
 app = FastAPI(title="Agent Webhook Handler")
 
 AGENT_RUN_LOCK = asyncio.Lock()
 redis_client: Redis | None = None
+retry_worker_task: asyncio.Task | None = None
 
 ISSUE_KEY_PREFIX = "issue:"
 SESSION_KEY_PREFIX = "session:"
 ISSUE_INDEX_KEY = "issues:index"
 SESSION_INDEX_KEY = "sessions:index"
+RETRY_INDEX_KEY = "issues:retry:index"
+DEAD_LETTER_INDEX_KEY = "issues:dead_letter:index"
 
 
 def parse_allowlist(raw_value: str) -> set[str]:
@@ -79,6 +86,16 @@ async def store_issue(issue: Dict[str, Any]) -> None:
     queue_key = issue["queue_key"]
     await redis.set(_issue_storage_key(queue_key), json.dumps(issue))
     await redis.zadd(ISSUE_INDEX_KEY, {queue_key: datetime.utcnow().timestamp()})
+    status = issue.get("status")
+    if status == "queued_retry" and issue.get("next_retry_at"):
+        retry_ts = datetime.fromisoformat(issue["next_retry_at"]).timestamp()
+        await redis.zadd(RETRY_INDEX_KEY, {queue_key: retry_ts})
+    else:
+        await redis.zrem(RETRY_INDEX_KEY, queue_key)
+    if status == "dead_letter":
+        await redis.zadd(DEAD_LETTER_INDEX_KEY, {queue_key: datetime.utcnow().timestamp()})
+    else:
+        await redis.zrem(DEAD_LETTER_INDEX_KEY, queue_key)
 
 
 async def load_issue(queue_key: str) -> Dict[str, Any] | None:
@@ -98,6 +115,19 @@ async def list_issues() -> List[Dict[str, Any]]:
         if value:
             issues.append(json.loads(value))
     return issues
+
+
+async def list_dead_letters() -> List[Dict[str, Any]]:
+    redis = await get_redis()
+    queue_keys = await redis.zrevrange(DEAD_LETTER_INDEX_KEY, 0, -1)
+    if not queue_keys:
+        return []
+    values = await redis.mget([_issue_storage_key(k) for k in queue_keys])
+    dead_letters: List[Dict[str, Any]] = []
+    for value in values:
+        if value:
+            dead_letters.append(json.loads(value))
+    return dead_letters
 
 
 async def store_session(session_data: Dict[str, Any], created_at: str) -> None:
@@ -169,6 +199,41 @@ def build_repo_url(repo_full_name: str, clone_url: str = "") -> str:
     return f"https://github.com/{repo_full_name}.git"
 
 
+def compute_retry_delay_seconds(attempt_count: int) -> int:
+    delay = RETRY_BASE_DELAY_SECONDS * (2 ** max(attempt_count - 1, 0))
+    return min(delay, RETRY_MAX_DELAY_SECONDS)
+
+
+def now_utc() -> datetime:
+    return datetime.utcnow()
+
+
+async def retry_worker_loop() -> None:
+    while True:
+        try:
+            redis = await get_redis()
+            now_ts = now_utc().timestamp()
+            due_keys = await redis.zrangebyscore(RETRY_INDEX_KEY, 0, now_ts)
+            for queue_key in due_keys:
+                issue = await load_issue(queue_key)
+                if not issue:
+                    await redis.zrem(RETRY_INDEX_KEY, queue_key)
+                    continue
+                if issue.get("status") != "queued_retry":
+                    await redis.zrem(RETRY_INDEX_KEY, queue_key)
+                    continue
+                issue["status"] = "approved"
+                issue["retried_at"] = now_utc().isoformat()
+                issue.pop("next_retry_at", None)
+                await store_issue(issue)
+                asyncio.create_task(run_agent_for_issue(queue_key))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"Retry worker error: {exc}")
+        await asyncio.sleep(RETRY_POLL_INTERVAL_SECONDS)
+
+
 async def run_agent_for_issue(queue_key: str) -> None:
     """Run orchestrator for a queued issue."""
     async with AGENT_RUN_LOCK:
@@ -179,7 +244,8 @@ async def run_agent_for_issue(queue_key: str) -> None:
             return
 
         issue["status"] = "processing"
-        issue["started_at"] = datetime.utcnow().isoformat()
+        issue["started_at"] = now_utc().isoformat()
+        issue["attempt_count"] = int(issue.get("attempt_count", 0)) + 1
         await store_issue(issue)
         repo_url = build_repo_url(issue["repo_full_name"], issue.get("repo_clone_url", ""))
         orchestrator = AgentOrchestrator(
@@ -198,14 +264,26 @@ async def run_agent_for_issue(queue_key: str) -> None:
         )
         await store_session(session.to_dict(), session.created_at)
         issue["assigned_agent"] = session.session_id
-        issue["completed_at"] = datetime.utcnow().isoformat()
-        issue["status"] = "completed" if session.status == "completed" else "failed"
-        issue["output_pr"] = {
-            "number": session.output_pr_number,
-            "url": session.output_pr_url,
-        }
-        if session.errors:
-            issue["errors"] = session.errors
+        issue["completed_at"] = now_utc().isoformat()
+        issue["output_pr"] = {"number": session.output_pr_number, "url": session.output_pr_url}
+        if session.status == "completed":
+            issue["status"] = "completed"
+            issue.pop("next_retry_at", None)
+        else:
+            errors = session.errors or ["Agent run failed without explicit error message."]
+            issue["errors"] = errors
+            issue["last_error"] = errors[-1]
+            attempts_used = int(issue.get("attempt_count", 1))
+            retries_used = max(attempts_used - 1, 0)
+            if retries_used < MAX_RETRIES:
+                delay_seconds = compute_retry_delay_seconds(attempts_used)
+                retry_at = now_utc() + timedelta(seconds=delay_seconds)
+                issue["status"] = "queued_retry"
+                issue["next_retry_at"] = retry_at.isoformat()
+            else:
+                issue["status"] = "dead_letter"
+                issue["dead_lettered_at"] = now_utc().isoformat()
+                issue.pop("next_retry_at", None)
         await store_issue(issue)
 
 
@@ -225,13 +303,22 @@ async def health() -> Dict[str, str]:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    global retry_worker_task
     redis = await get_redis()
     await redis.ping()
+    retry_worker_task = asyncio.create_task(retry_worker_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global redis_client
+    global redis_client, retry_worker_task
+    if retry_worker_task is not None:
+        retry_worker_task.cancel()
+        try:
+            await retry_worker_task
+        except asyncio.CancelledError:
+            pass
+        retry_worker_task = None
     if redis_client is not None:
         await redis_client.aclose()
         redis_client = None
@@ -334,7 +421,10 @@ async def process_issue_event(event_type: str, payload: Dict[str, Any]) -> None:
             "sender": sender,
             "repo_full_name": repo_full_name,
             "repo_clone_url": repo_clone_url,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": now_utc().isoformat(),
+            "attempt_count": 0,
+            "next_retry_at": None,
+            "last_error": None,
             "assigned_agent": None,
             "output_pr": None,
         }
@@ -375,7 +465,11 @@ async def approve_issue(
         raise HTTPException(status_code=404, detail="Issue not found")
 
     issue["status"] = "approved"
-    issue["approved_at"] = datetime.utcnow().isoformat()
+    issue["approved_at"] = now_utc().isoformat()
+    issue["attempt_count"] = 0
+    issue["next_retry_at"] = None
+    issue["last_error"] = None
+    issue.pop("dead_lettered_at", None)
     await store_issue(issue)
     background_tasks.add_task(run_agent_for_issue, queue_key)
     return {"status": "approved", "issue": issue}
@@ -393,7 +487,8 @@ async def reject_issue(
         raise HTTPException(status_code=404, detail="Issue not found")
 
     issue["status"] = "rejected"
-    issue["rejected_at"] = datetime.utcnow().isoformat()
+    issue["rejected_at"] = now_utc().isoformat()
+    issue["next_retry_at"] = None
     await store_issue(issue)
     return {"status": "rejected", "issue": issue}
 
@@ -402,6 +497,32 @@ async def reject_issue(
 async def get_sessions():
     """Get completed/active agent sessions."""
     return {"sessions": await list_sessions()}
+
+
+@app.get("/api/dead-letter/issues")
+async def get_dead_letter_issues():
+    """List dead-lettered issues that exceeded retry attempts."""
+    return {"issues": await list_dead_letters()}
+
+
+@app.post("/api/issues/{queue_key}/requeue")
+async def requeue_issue(
+    queue_key: str,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Manually requeue an issue, resetting retry counters."""
+    verify_admin_token(x_admin_token)
+    issue = await load_issue(queue_key)
+    if not issue:
+        raise HTTPException(status_code=404, detail="Issue not found")
+    issue["status"] = "approved"
+    issue["attempt_count"] = 0
+    issue["next_retry_at"] = None
+    issue["last_error"] = None
+    issue.pop("dead_lettered_at", None)
+    await store_issue(issue)
+    asyncio.create_task(run_agent_for_issue(queue_key))
+    return {"status": "requeued", "issue": issue}
 
 
 if __name__ == "__main__":

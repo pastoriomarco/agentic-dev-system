@@ -15,6 +15,10 @@ services:
       - ALLOWED_REPOS=${ALLOWED_REPOS:-}
       - ADMIN_API_TOKEN=${ADMIN_API_TOKEN:-}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - MAX_RETRIES=${MAX_RETRIES:-3}
+      - RETRY_BASE_DELAY_SECONDS=${RETRY_BASE_DELAY_SECONDS:-60}
+      - RETRY_MAX_DELAY_SECONDS=${RETRY_MAX_DELAY_SECONDS:-1800}
+      - RETRY_POLL_INTERVAL_SECONDS=${RETRY_POLL_INTERVAL_SECONDS:-15}
       - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:8080/v1/chat/completions}
       - LLM_MODEL=${LLM_MODEL:-qwen3-coder-next}
       - DATABASE_URL=${DATABASE_URL:-sqlite:///agent_queue.db}

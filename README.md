@@ -33,6 +33,7 @@ Edit `.env` with real values:
 - `ADMIN_API_TOKEN` (recommended)
 - `REDIS_URL` (defaults to local compose Redis)
 - `ALLOWED_REPOS` (recommended for multi-repo safety)
+- `MAX_RETRIES`, `RETRY_BASE_DELAY_SECONDS`, `RETRY_MAX_DELAY_SECONDS`, `RETRY_POLL_INTERVAL_SECONDS`
 
 Start:
 
@@ -84,6 +85,20 @@ curl -X POST \
   http://localhost:8000/api/issues/<queue_key>/reject
 ```
 
+Dead-letter list:
+
+```bash
+curl http://localhost:8000/api/dead-letter/issues
+```
+
+Requeue dead-lettered issue:
+
+```bash
+curl -X POST \
+  -H "X-Admin-Token: <ADMIN_API_TOKEN>" \
+  http://localhost:8000/api/issues/<queue_key>/requeue
+```
+
 List sessions:
 
 ```bash
@@ -103,6 +118,7 @@ Queue key format:
 - Queue and session persistence are stored in Redis.
 - Webhooks are accepted only from allowlisted repos.
 : If `ALLOWED_REPOS` is empty, the service defaults to allowlisting `GITHUB_OWNER/GITHUB_REPO` when set.
+- Failed runs are retried with exponential backoff and moved to dead-letter after max retries.
 
 ## Practical deployment suggestions
 
@@ -116,14 +132,12 @@ Queue key format:
 
 ## Current limitations
 
-- No retry policy yet.
 - No sandboxing per task container yet.
 - Code generation is currently deterministic scaffolding in `agentic_changes/issue_<n>.md`.
 
 ## Next hardening steps
 
 - Add durable SQL state for audit/reporting (Postgres) alongside Redis operational state.
-- Add retry/backoff and dead-letter queue.
 - Add policy checks before PR creation.
 - Add per-target-repo allowlist and path restrictions.
 - Add integration tests for webhook event fixtures.
