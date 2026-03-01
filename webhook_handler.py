@@ -1,22 +1,27 @@
 """
 GitHub Webhook Handler for Agentic Developer System.
-Receives issue/PR events, queues them, and runs an agent after approval.
+Receives issue/PR events, queues them in Redis, and runs each approved task in
+an isolated short-lived worker container.
 """
 
+import asyncio
 import hashlib
 import hmac
-import os
-import asyncio
 import json
+import os
+import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List
 
 import httpx
+from docker import from_env as docker_from_env
+from docker.client import DockerClient
+from docker.errors import DockerException
+from docker.types import Mount
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
-
-from agent_orchestrator import AgentOrchestrator
 
 # Configuration
 WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
@@ -31,10 +36,21 @@ RETRY_BASE_DELAY_SECONDS = int(os.environ.get("RETRY_BASE_DELAY_SECONDS", "60"))
 RETRY_MAX_DELAY_SECONDS = int(os.environ.get("RETRY_MAX_DELAY_SECONDS", "1800"))
 RETRY_POLL_INTERVAL_SECONDS = int(os.environ.get("RETRY_POLL_INTERVAL_SECONDS", "15"))
 
+WORKER_IMAGE = os.environ.get("WORKER_IMAGE", "agentic-dev-system:latest")
+WORKER_NETWORK = os.environ.get("WORKER_NETWORK", "bridge")
+WORKER_TIMEOUT_SECONDS = int(os.environ.get("WORKER_TIMEOUT_SECONDS", "1800"))
+WORKER_CPU_LIMIT = float(os.environ.get("WORKER_CPU_LIMIT", "1.0"))
+WORKER_MEMORY_LIMIT = os.environ.get("WORKER_MEMORY_LIMIT", "2g")
+WORKER_PIDS_LIMIT = int(os.environ.get("WORKER_PIDS_LIMIT", "256"))
+WORKER_ARTIFACTS_DIR = Path(os.environ.get("WORKER_ARTIFACTS_DIR", "/worker-artifacts"))
+WORKER_ARTIFACTS_VOLUME = os.environ.get("WORKER_ARTIFACTS_VOLUME", "worker-artifacts")
+WORKER_VOLUME_PREFIX = os.environ.get("WORKER_VOLUME_PREFIX", "agent-task")
+
 app = FastAPI(title="Agent Webhook Handler")
 
 AGENT_RUN_LOCK = asyncio.Lock()
 redis_client: Redis | None = None
+docker_client: DockerClient | None = None
 retry_worker_task: asyncio.Task | None = None
 
 ISSUE_KEY_PREFIX = "issue:"
@@ -43,6 +59,10 @@ ISSUE_INDEX_KEY = "issues:index"
 SESSION_INDEX_KEY = "sessions:index"
 RETRY_INDEX_KEY = "issues:retry:index"
 DEAD_LETTER_INDEX_KEY = "issues:dead_letter:index"
+
+
+def now_utc() -> datetime:
+    return datetime.utcnow()
 
 
 def parse_allowlist(raw_value: str) -> set[str]:
@@ -55,15 +75,33 @@ if not ALLOWLIST and GITHUB_OWNER and GITHUB_REPO:
     ALLOWLIST = {f"{GITHUB_OWNER.lower()}/{GITHUB_REPO.lower()}"}
 
 
+def is_repo_allowed(repo_full_name: str) -> bool:
+    if not ALLOWLIST:
+        return True
+    return repo_full_name.lower() in ALLOWLIST
+
+
 def build_queue_key(repo_full_name: str, issue_number: int) -> str:
     repo_token = repo_full_name.replace("/", ":")
     return f"{repo_token}:{issue_number}"
 
 
-def is_repo_allowed(repo_full_name: str) -> bool:
-    if not ALLOWLIST:
-        return True
-    return repo_full_name.lower() in ALLOWLIST
+def build_repo_url(repo_full_name: str, clone_url: str = "") -> str:
+    if clone_url:
+        return clone_url
+    return f"https://github.com/{repo_full_name}.git"
+
+
+def verify_admin_token(header_value: str | None) -> None:
+    if not ADMIN_API_TOKEN:
+        return
+    if not header_value or not hmac.compare_digest(header_value, ADMIN_API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+
+
+def compute_retry_delay_seconds(attempt_count: int) -> int:
+    delay = RETRY_BASE_DELAY_SECONDS * (2 ** max(attempt_count - 1, 0))
+    return min(delay, RETRY_MAX_DELAY_SECONDS)
 
 
 async def get_redis() -> Redis:
@@ -71,6 +109,13 @@ async def get_redis() -> Redis:
     if redis_client is None:
         redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
     return redis_client
+
+
+def get_docker_client() -> DockerClient:
+    global docker_client
+    if docker_client is None:
+        docker_client = docker_from_env()
+    return docker_client
 
 
 def _issue_storage_key(queue_key: str) -> str:
@@ -85,7 +130,7 @@ async def store_issue(issue: Dict[str, Any]) -> None:
     redis = await get_redis()
     queue_key = issue["queue_key"]
     await redis.set(_issue_storage_key(queue_key), json.dumps(issue))
-    await redis.zadd(ISSUE_INDEX_KEY, {queue_key: datetime.utcnow().timestamp()})
+    await redis.zadd(ISSUE_INDEX_KEY, {queue_key: now_utc().timestamp()})
     status = issue.get("status")
     if status == "queued_retry" and issue.get("next_retry_at"):
         retry_ts = datetime.fromisoformat(issue["next_retry_at"]).timestamp()
@@ -93,7 +138,7 @@ async def store_issue(issue: Dict[str, Any]) -> None:
     else:
         await redis.zrem(RETRY_INDEX_KEY, queue_key)
     if status == "dead_letter":
-        await redis.zadd(DEAD_LETTER_INDEX_KEY, {queue_key: datetime.utcnow().timestamp()})
+        await redis.zadd(DEAD_LETTER_INDEX_KEY, {queue_key: now_utc().timestamp()})
     else:
         await redis.zrem(DEAD_LETTER_INDEX_KEY, queue_key)
 
@@ -110,11 +155,7 @@ async def list_issues() -> List[Dict[str, Any]]:
     if not queue_keys:
         return []
     values = await redis.mget([_issue_storage_key(k) for k in queue_keys])
-    issues: List[Dict[str, Any]] = []
-    for value in values:
-        if value:
-            issues.append(json.loads(value))
-    return issues
+    return [json.loads(v) for v in values if v]
 
 
 async def list_dead_letters() -> List[Dict[str, Any]]:
@@ -123,11 +164,7 @@ async def list_dead_letters() -> List[Dict[str, Any]]:
     if not queue_keys:
         return []
     values = await redis.mget([_issue_storage_key(k) for k in queue_keys])
-    dead_letters: List[Dict[str, Any]] = []
-    for value in values:
-        if value:
-            dead_letters.append(json.loads(value))
-    return dead_letters
+    return [json.loads(v) for v in values if v]
 
 
 async def store_session(session_data: Dict[str, Any], created_at: str) -> None:
@@ -144,11 +181,7 @@ async def list_sessions() -> List[Dict[str, Any]]:
     if not session_ids:
         return []
     values = await redis.mget([_session_storage_key(s) for s in session_ids])
-    sessions: List[Dict[str, Any]] = []
-    for value in values:
-        if value:
-            sessions.append(json.loads(value))
-    return sessions
+    return [json.loads(v) for v in values if v]
 
 
 async def verify_github_signature(request: Request, signature: str) -> bool:
@@ -168,7 +201,6 @@ async def notify_slack(event_type: str, issue_number: int, title: str) -> None:
     slack_webhook = os.environ.get("SLACK_WEBHOOK_URL")
     if not slack_webhook:
         return
-
     message = {
         "text": f"New GitHub event: #{issue_number} - {title}",
         "blocks": [
@@ -185,7 +217,6 @@ async def notify_slack(event_type: str, issue_number: int, title: str) -> None:
             }
         ],
     }
-
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             await client.post(slack_webhook, json=message)
@@ -193,19 +224,147 @@ async def notify_slack(event_type: str, issue_number: int, title: str) -> None:
             print(f"Slack notification failed: {exc}")
 
 
-def build_repo_url(repo_full_name: str, clone_url: str = "") -> str:
-    if clone_url:
-        return clone_url
-    return f"https://github.com/{repo_full_name}.git"
+def _run_worker_container(issue: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
+    """
+    Run a one-off worker container and return (session_payload, logs).
+    This function runs in a thread via asyncio.to_thread.
+    """
+    client = get_docker_client()
+    job_id = uuid.uuid4().hex
+    workspace_volume_name = f"{WORKER_VOLUME_PREFIX}-ws-{job_id}"
+    artifact_host_path = WORKER_ARTIFACTS_DIR / f"{job_id}.json"
+    artifact_container_path = f"/artifacts/{job_id}.json"
+    repo_url = build_repo_url(issue["repo_full_name"], issue.get("repo_clone_url", ""))
+
+    session_payload: Dict[str, Any] = {
+        "session_id": "",
+        "status": "failed",
+        "created_at": now_utc().isoformat(),
+        "started_at": now_utc().isoformat(),
+        "completed_at": now_utc().isoformat(),
+        "errors": [],
+        "logs": [],
+    }
+    logs_text = ""
+    container = None
+    workspace_volume = None
+
+    try:
+        if artifact_host_path.exists():
+            artifact_host_path.unlink()
+        workspace_volume = client.volumes.create(name=workspace_volume_name)
+        mounts = [
+            Mount(target="/workspace", source=workspace_volume_name, type="volume", read_only=False),
+            Mount(target="/artifacts", source=WORKER_ARTIFACTS_VOLUME, type="volume", read_only=False),
+        ]
+        env = {
+            "ISSUE_JSON": json.dumps(
+                {
+                    "issue_number": issue["issue_number"],
+                    "title": issue["title"],
+                    "body": issue["body"],
+                    "is_pr": issue["is_pr"],
+                    "repo_name": issue["repo_full_name"],
+                }
+            ),
+            "OUTPUT_PATH": artifact_container_path,
+            "GITHUB_TOKEN": GITHUB_TOKEN,
+            "TARGET_REPO_URL": repo_url,
+            "GITHUB_BASE_BRANCH": os.environ.get("GITHUB_BASE_BRANCH", "main"),
+            "LLM_API_URL": os.environ.get("LLM_API_URL", ""),
+            "LLM_MODEL": os.environ.get("LLM_MODEL", ""),
+        }
+
+        container = client.containers.run(
+            WORKER_IMAGE,
+            command=["python", "worker_entrypoint.py"],
+            environment=env,
+            mounts=mounts,
+            network=WORKER_NETWORK,
+            detach=True,
+            user="0:0",
+            read_only=True,
+            tmpfs={"/tmp": "rw,noexec,nosuid,size=256m"},
+            mem_limit=WORKER_MEMORY_LIMIT,
+            nano_cpus=int(WORKER_CPU_LIMIT * 1_000_000_000),
+            pids_limit=WORKER_PIDS_LIMIT,
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges"],
+        )
+        container.wait(timeout=WORKER_TIMEOUT_SECONDS)
+        logs_text = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+
+        if artifact_host_path.exists():
+            session_payload = json.loads(artifact_host_path.read_text(encoding="utf-8"))
+        else:
+            session_payload["errors"] = ["Worker completed without producing session artifact."]
+
+    except Exception as exc:
+        session_payload["errors"] = [f"Worker container execution failed: {exc}"]
+    finally:
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+        if workspace_volume is not None:
+            try:
+                workspace_volume.remove(force=True)
+            except Exception:
+                pass
+
+    return session_payload, logs_text
 
 
-def compute_retry_delay_seconds(attempt_count: int) -> int:
-    delay = RETRY_BASE_DELAY_SECONDS * (2 ** max(attempt_count - 1, 0))
-    return min(delay, RETRY_MAX_DELAY_SECONDS)
+async def run_agent_for_issue(queue_key: str) -> None:
+    """Run orchestrator for a queued issue inside isolated worker container."""
+    async with AGENT_RUN_LOCK:
+        issue = await load_issue(queue_key)
+        if not issue:
+            return
+        if issue.get("status") in {"processing", "completed"}:
+            return
 
+        issue["status"] = "processing"
+        issue["started_at"] = now_utc().isoformat()
+        issue["attempt_count"] = int(issue.get("attempt_count", 0)) + 1
+        await store_issue(issue)
 
-def now_utc() -> datetime:
-    return datetime.utcnow()
+        session_data, worker_logs = await asyncio.to_thread(_run_worker_container, issue)
+        session_data.setdefault("session_id", str(uuid.uuid4()))
+        session_data.setdefault("created_at", now_utc().isoformat())
+        session_data.setdefault("status", "failed")
+        if worker_logs:
+            logs = session_data.get("logs") or []
+            logs.append(worker_logs[-4000:])
+            session_data["logs"] = logs
+
+        await store_session(session_data, session_data["created_at"])
+        issue["assigned_agent"] = session_data["session_id"]
+        issue["completed_at"] = now_utc().isoformat()
+        issue["output_pr"] = {
+            "number": session_data.get("output_pr_number"),
+            "url": session_data.get("output_pr_url"),
+        }
+        if session_data.get("status") == "completed":
+            issue["status"] = "completed"
+            issue.pop("next_retry_at", None)
+        else:
+            errors = session_data.get("errors") or ["Agent run failed without explicit error message."]
+            issue["errors"] = errors
+            issue["last_error"] = errors[-1]
+            attempts_used = int(issue.get("attempt_count", 1))
+            retries_used = max(attempts_used - 1, 0)
+            if retries_used < MAX_RETRIES:
+                delay_seconds = compute_retry_delay_seconds(attempts_used)
+                retry_at = now_utc() + timedelta(seconds=delay_seconds)
+                issue["status"] = "queued_retry"
+                issue["next_retry_at"] = retry_at.isoformat()
+            else:
+                issue["status"] = "dead_letter"
+                issue["dead_lettered_at"] = now_utc().isoformat()
+                issue.pop("next_retry_at", None)
+        await store_issue(issue)
 
 
 async def retry_worker_loop() -> None:
@@ -234,70 +393,11 @@ async def retry_worker_loop() -> None:
         await asyncio.sleep(RETRY_POLL_INTERVAL_SECONDS)
 
 
-async def run_agent_for_issue(queue_key: str) -> None:
-    """Run orchestrator for a queued issue."""
-    async with AGENT_RUN_LOCK:
-        issue = await load_issue(queue_key)
-        if not issue:
-            return
-        if issue.get("status") in {"processing", "completed"}:
-            return
-
-        issue["status"] = "processing"
-        issue["started_at"] = now_utc().isoformat()
-        issue["attempt_count"] = int(issue.get("attempt_count", 0)) + 1
-        await store_issue(issue)
-        repo_url = build_repo_url(issue["repo_full_name"], issue.get("repo_clone_url", ""))
-        orchestrator = AgentOrchestrator(
-            github_token=GITHUB_TOKEN,
-            repo_url=repo_url,
-            working_base="/app/workspace",
-        )
-        session = await orchestrator.process_issue(
-            {
-                "issue_number": issue["issue_number"],
-                "title": issue["title"],
-                "body": issue["body"],
-                "is_pr": issue["is_pr"],
-                "repo_name": issue["repo_full_name"],
-            }
-        )
-        await store_session(session.to_dict(), session.created_at)
-        issue["assigned_agent"] = session.session_id
-        issue["completed_at"] = now_utc().isoformat()
-        issue["output_pr"] = {"number": session.output_pr_number, "url": session.output_pr_url}
-        if session.status == "completed":
-            issue["status"] = "completed"
-            issue.pop("next_retry_at", None)
-        else:
-            errors = session.errors or ["Agent run failed without explicit error message."]
-            issue["errors"] = errors
-            issue["last_error"] = errors[-1]
-            attempts_used = int(issue.get("attempt_count", 1))
-            retries_used = max(attempts_used - 1, 0)
-            if retries_used < MAX_RETRIES:
-                delay_seconds = compute_retry_delay_seconds(attempts_used)
-                retry_at = now_utc() + timedelta(seconds=delay_seconds)
-                issue["status"] = "queued_retry"
-                issue["next_retry_at"] = retry_at.isoformat()
-            else:
-                issue["status"] = "dead_letter"
-                issue["dead_lettered_at"] = now_utc().isoformat()
-                issue.pop("next_retry_at", None)
-        await store_issue(issue)
-
-
-def verify_admin_token(header_value: str | None) -> None:
-    if not ADMIN_API_TOKEN:
-        return
-    if not header_value or not hmac.compare_digest(header_value, ADMIN_API_TOKEN):
-        raise HTTPException(status_code=401, detail="Invalid admin token")
-
-
 @app.get("/health")
 async def health() -> Dict[str, str]:
     redis = await get_redis()
     await redis.ping()
+    await asyncio.to_thread(get_docker_client().ping)
     return {"status": "ok"}
 
 
@@ -306,12 +406,14 @@ async def startup_event() -> None:
     global retry_worker_task
     redis = await get_redis()
     await redis.ping()
+    await asyncio.to_thread(get_docker_client().ping)
+    WORKER_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     retry_worker_task = asyncio.create_task(retry_worker_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global redis_client, retry_worker_task
+    global redis_client, retry_worker_task, docker_client
     if retry_worker_task is not None:
         retry_worker_task.cancel()
         try:
@@ -322,14 +424,13 @@ async def shutdown_event() -> None:
     if redis_client is not None:
         await redis_client.aclose()
         redis_client = None
+    if docker_client is not None:
+        docker_client.close()
+        docker_client = None
 
 
 @app.post("/webhook/github")
 async def github_webhook(request: Request, background_tasks: BackgroundTasks):
-    """
-    GitHub webhook endpoint.
-    Triggers: issues, pull_request, issue_comment, pull_request_review, pull_request_review_comment
-    """
     github_event = request.headers.get("X-GitHub-Event", "")
     signature = request.headers.get("X-Hub-Signature-256", "")
 
@@ -439,13 +540,11 @@ async def process_issue_event(event_type: str, payload: Dict[str, Any]) -> None:
 
 @app.get("/api/issues")
 async def get_queue():
-    """Get all queued issues."""
     return {"issues": await list_issues()}
 
 
 @app.get("/api/issues/{queue_key}")
 async def get_issue(queue_key: str):
-    """Get specific queued issue details."""
     issue = await load_issue(queue_key)
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
@@ -458,12 +557,10 @@ async def approve_issue(
     background_tasks: BackgroundTasks,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Approve an issue and start agent processing."""
     verify_admin_token(x_admin_token)
     issue = await load_issue(queue_key)
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
-
     issue["status"] = "approved"
     issue["approved_at"] = now_utc().isoformat()
     issue["attempt_count"] = 0
@@ -480,12 +577,10 @@ async def reject_issue(
     queue_key: str,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Reject an issue (no agent processing)."""
     verify_admin_token(x_admin_token)
     issue = await load_issue(queue_key)
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
-
     issue["status"] = "rejected"
     issue["rejected_at"] = now_utc().isoformat()
     issue["next_retry_at"] = None
@@ -495,13 +590,11 @@ async def reject_issue(
 
 @app.get("/api/sessions")
 async def get_sessions():
-    """Get completed/active agent sessions."""
     return {"sessions": await list_sessions()}
 
 
 @app.get("/api/dead-letter/issues")
 async def get_dead_letter_issues():
-    """List dead-lettered issues that exceeded retry attempts."""
     return {"issues": await list_dead_letters()}
 
 
@@ -510,7 +603,6 @@ async def requeue_issue(
     queue_key: str,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Manually requeue an issue, resetting retry counters."""
     verify_admin_token(x_admin_token)
     issue = await load_issue(queue_key)
     if not issue:

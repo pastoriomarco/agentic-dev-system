@@ -1,7 +1,9 @@
 services:
   webhook:
+    image: agentic-dev-system:latest
     build: .
     container_name: agent-webhook
+    user: "0:0"
     depends_on:
       - redis
     env_file:
@@ -19,14 +21,24 @@ services:
       - RETRY_BASE_DELAY_SECONDS=${RETRY_BASE_DELAY_SECONDS:-60}
       - RETRY_MAX_DELAY_SECONDS=${RETRY_MAX_DELAY_SECONDS:-1800}
       - RETRY_POLL_INTERVAL_SECONDS=${RETRY_POLL_INTERVAL_SECONDS:-15}
+      - WORKER_IMAGE=${WORKER_IMAGE:-agentic-dev-system:latest}
+      - WORKER_NETWORK=${WORKER_NETWORK:-bridge}
+      - WORKER_TIMEOUT_SECONDS=${WORKER_TIMEOUT_SECONDS:-1800}
+      - WORKER_CPU_LIMIT=${WORKER_CPU_LIMIT:-1.0}
+      - WORKER_MEMORY_LIMIT=${WORKER_MEMORY_LIMIT:-2g}
+      - WORKER_PIDS_LIMIT=${WORKER_PIDS_LIMIT:-256}
+      - WORKER_ARTIFACTS_DIR=${WORKER_ARTIFACTS_DIR:-/worker-artifacts}
+      - WORKER_ARTIFACTS_VOLUME=${WORKER_ARTIFACTS_VOLUME:-worker-artifacts}
+      - WORKER_VOLUME_PREFIX=${WORKER_VOLUME_PREFIX:-agent-task}
       - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:8080/v1/chat/completions}
       - LLM_MODEL=${LLM_MODEL:-qwen3-coder-next}
       - DATABASE_URL=${DATABASE_URL:-sqlite:///agent_queue.db}
     ports:
       - "8000:8000"
     volumes:
-      - ./workspace:/app/workspace
       - ./logs:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+      - worker-artifacts:/worker-artifacts
     restart: unless-stopped
 
   redis:
@@ -39,3 +51,4 @@ services:
 
 volumes:
   redis-data:
+  worker-artifacts:
