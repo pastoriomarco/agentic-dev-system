@@ -25,6 +25,8 @@ from redis.asyncio import Redis
 
 # Configuration
 WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+RUNTIME_ENV = os.environ.get("DEPLOYMENT_ENV", "development").strip().lower()
+WEBHOOK_DELIVERY_TTL_SECONDS = int(os.environ.get("WEBHOOK_DELIVERY_TTL_SECONDS", "86400"))
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN", "")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -76,6 +78,15 @@ ISSUE_INDEX_KEY = "issues:index"
 SESSION_INDEX_KEY = "sessions:index"
 RETRY_INDEX_KEY = "issues:retry:index"
 DEAD_LETTER_INDEX_KEY = "issues:dead_letter:index"
+WEBHOOK_DELIVERY_KEY_PREFIX = "webhook:delivery:"
+
+SUPPORTED_WEBHOOK_ACTIONS: Dict[str, set[str]] = {
+    "issues": {"opened", "edited", "reopened"},
+    "pull_request": {"opened", "edited", "reopened", "synchronize"},
+    "issue_comment": {"created"},
+    "pull_request_review": {"submitted", "edited"},
+    "pull_request_review_comment": {"created"},
+}
 
 ALL_AGENT_LABELS = [
     LABEL_QUEUED,
@@ -138,6 +149,15 @@ def compute_retry_delay_seconds(attempt_count: int) -> int:
     return min(delay, RETRY_MAX_DELAY_SECONDS)
 
 
+def is_production_runtime() -> bool:
+    return RUNTIME_ENV in {"prod", "production"}
+
+
+def validate_runtime_configuration() -> None:
+    if is_production_runtime() and not WEBHOOK_SECRET:
+        raise RuntimeError("GITHUB_WEBHOOK_SECRET is required when DEPLOYMENT_ENV is set to production.")
+
+
 async def get_redis() -> Redis:
     global redis_client
     if redis_client is None:
@@ -158,6 +178,38 @@ def _issue_storage_key(queue_key: str) -> str:
 
 def _session_storage_key(session_id: str) -> str:
     return f"{SESSION_KEY_PREFIX}{session_id}"
+
+
+def _delivery_storage_key(delivery_id: str) -> str:
+    return f"{WEBHOOK_DELIVERY_KEY_PREFIX}{delivery_id}"
+
+
+def is_supported_webhook_action(event_type: str, action: str) -> bool:
+    supported_actions = SUPPORTED_WEBHOOK_ACTIONS.get(event_type)
+    if not supported_actions:
+        return False
+    return action in supported_actions
+
+
+async def claim_delivery_id(delivery_id: str) -> bool:
+    redis = await get_redis()
+    key = _delivery_storage_key(delivery_id)
+    value = now_utc().isoformat()
+    try:
+        claimed = await redis.set(
+            key,
+            value,
+            ex=WEBHOOK_DELIVERY_TTL_SECONDS,
+            nx=True,
+        )
+    except TypeError:
+        # Compatibility path for lightweight/fake redis clients used in unit tests.
+        existing = await redis.get(key)
+        if existing:
+            return False
+        await redis.set(key, value)
+        return True
+    return bool(claimed)
 
 
 async def store_issue(issue: Dict[str, Any]) -> None:
@@ -221,7 +273,7 @@ async def list_sessions() -> List[Dict[str, Any]]:
 async def verify_github_signature(request: Request, signature: str) -> bool:
     """Verify GitHub webhook signature using HMAC SHA-256."""
     if not WEBHOOK_SECRET:
-        return True
+        return not is_production_runtime()
     if not signature:
         return False
     payload = await request.body()
@@ -627,6 +679,7 @@ async def health_deep() -> JSONResponse:
 @app.on_event("startup")
 async def startup_event() -> None:
     global retry_worker_task
+    validate_runtime_configuration()
     redis = await get_redis()
     await redis.ping()
     await asyncio.to_thread(get_docker_client().ping)
@@ -656,11 +709,13 @@ async def shutdown_event() -> None:
 async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     github_event = request.headers.get("X-GitHub-Event", "")
     signature = request.headers.get("X-Hub-Signature-256", "")
+    delivery_id = request.headers.get("X-GitHub-Delivery", "").strip()
 
     if not await verify_github_signature(request, signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     payload = await request.json()
+    action = payload.get("action", "")
     repo_full_name = payload.get("repository", {}).get("full_name", "").strip()
     if repo_full_name and not is_repo_allowed(repo_full_name):
         print(f"Ignoring webhook from non-allowlisted repo: {repo_full_name}")
@@ -669,20 +724,29 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
             status_code=202,
         )
 
-    supported = {
-        "issues",
-        "pull_request",
-        "issue_comment",
-        "pull_request_review",
-        "pull_request_review_comment",
-    }
-    if github_event in supported:
-        background_tasks.add_task(process_issue_event, github_event, payload)
+    if github_event not in SUPPORTED_WEBHOOK_ACTIONS:
+        return JSONResponse({"status": "ignored", "reason": "unsupported_event", "event_type": github_event}, status_code=202)
+    if not is_supported_webhook_action(github_event, action):
+        return JSONResponse(
+            {"status": "ignored", "reason": "unsupported_action", "event_type": github_event, "action": action},
+            status_code=202,
+        )
+    if not delivery_id:
+        raise HTTPException(status_code=400, detail="Missing X-GitHub-Delivery header")
+    if not await claim_delivery_id(delivery_id):
+        return JSONResponse({"status": "ignored", "reason": "duplicate_delivery", "delivery_id": delivery_id}, status_code=202)
+
+    background_tasks.add_task(process_issue_event, github_event, payload, action, delivery_id)
 
     return JSONResponse({"status": "received"})
 
 
-async def process_issue_event(event_type: str, payload: Dict[str, Any]) -> None:
+async def process_issue_event(
+    event_type: str,
+    payload: Dict[str, Any],
+    action: str = "",
+    delivery_id: str = "",
+) -> None:
     """Process incoming GitHub events and store queue item."""
     try:
         repo = payload.get("repository", {})
@@ -736,6 +800,8 @@ async def process_issue_event(event_type: str, payload: Dict[str, Any]) -> None:
         issue = {
             "queue_key": queue_key,
             "event_type": event_type,
+            "event_action": action,
+            "delivery_id": delivery_id,
             "issue_number": issue_number,
             "title": title,
             "body": body,

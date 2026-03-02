@@ -13,6 +13,14 @@ This backlog is re-evaluated for:
 - `P2`: Later/scale-up (useful but heavier or context-dependent)
 - `P3`: Future/optional (defer until core is stable)
 
+## Implementation Status (Updated: 2026-03-02)
+
+- Completed:
+  - `Rank 1 / P0` Require webhook signature verification in production (fail closed if `GITHUB_WEBHOOK_SECRET` missing).
+  - `Rank 2 / P0` Add webhook deduplication/idempotency with `X-GitHub-Delivery` and explicit supported `action` filters.
+- Next up:
+  - `Rank 3 / P0` Add ingress hardening: request size limits + rate limiting on `/webhook/github`.
+
 ## Prioritized Backlog (Highest to Lowest)
 
 | Rank | Priority | Improvement | Impact | Complexity | Why this priority |

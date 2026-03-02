@@ -27,6 +27,8 @@ cp .env.example .env
 Edit `.env` with real values:
 
 - `GITHUB_WEBHOOK_SECRET`
+- `DEPLOYMENT_ENV` (`production` enforces non-empty `GITHUB_WEBHOOK_SECRET`)
+- `WEBHOOK_DELIVERY_TTL_SECONDS` (Redis dedup retention for `X-GitHub-Delivery`)
 - `GITHUB_TOKEN`
 - `GITHUB_OWNER`
 - `GITHUB_REPO`
@@ -58,6 +60,7 @@ In target repository settings:
 - `issue_comment`
 - `pull_request_review`
 - `pull_request_review_comment`
+- Supported actions are explicitly filtered (for example: `issues.opened`, `pull_request.opened/synchronize`, `issue_comment.created`).
 
 ## API usage
 
@@ -135,6 +138,8 @@ Queue key format:
 - Queue and session persistence are stored in Redis.
 - Webhooks are accepted only from allowlisted repos.
 : If `ALLOWED_REPOS` is empty, the service defaults to allowlisting `GITHUB_OWNER/GITHUB_REPO` when set.
+- In `production`, startup fails if `GITHUB_WEBHOOK_SECRET` is empty; unsigned webhooks are rejected.
+- Webhook delivery IDs (`X-GitHub-Delivery`) are deduplicated in Redis to prevent replay/duplicate processing.
 - Failed runs are retried with exponential backoff and moved to dead-letter after max retries.
 - Each approved issue runs inside a short-lived worker container with:
 : read-only root filesystem, dropped Linux caps, no-new-privileges, CPU/memory/pids limits, dedicated per-task workspace volume.
@@ -154,6 +159,7 @@ Queue key format:
 - Restrict approval API access at network layer and with `ADMIN_API_TOKEN`.
 - Set `ALLOWED_REPOS` explicitly in production.
 : Example: `ALLOWED_REPOS=pastoriomarco/agentic-dev-system,pastoriomarco/private-repo`
+- Set `DEPLOYMENT_ENV=production` in deployed environments so signature checks fail closed on misconfiguration.
 - This design requires Docker socket access by the webhook service.
 : Treat that host as privileged infrastructure and isolate it from untrusted multi-tenant workloads.
 - Worker internet egress is restricted through Squid proxy allowlist (`proxy/squid.conf`), defaulting to GitHub domains.
