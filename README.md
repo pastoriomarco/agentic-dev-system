@@ -2,6 +2,12 @@
 
 Webhook-driven agent workflow for GitHub issues and PR comments with mandatory human approval before execution.
 
+## Documentation
+
+- Quickstart and overview: this `README.md`
+- Full operating guide: [docs/USER_MANUAL.md](./docs/USER_MANUAL.md)
+- Hardening roadmap: [FUTURE_IMPROVEMENTS.md](./FUTURE_IMPROVEMENTS.md)
+
 ## What it does
 
 - Receives GitHub webhook events.
