@@ -168,7 +168,4 @@ Queue key format:
 
 ## Next hardening steps
 
-- Add durable SQL state for audit/reporting (Postgres) alongside Redis operational state.
-- Add semantic validation step (for example AST/static checks) before commit.
-- Add repository-specific policy bundles for path rules and mandatory quality commands.
-- Add integration tests for webhook event fixtures.
+See [FUTURE_IMPROVEMENTS.md](./FUTURE_IMPROVEMENTS.md) for the re-evaluated, prioritized roadmap (highest to lowest) with impact and complexity estimates.
