@@ -2,6 +2,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_orchestrator import AgentOrchestrator, AgentSession, NeedsHumanError
 
@@ -150,6 +151,18 @@ class AgentOrchestratorLLMSchemaTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session.status, "needs_human")
         self.assertIn("unsupported top-level keys", session.errors[0])
+
+    async def test_call_llm_blocks_metadata_endpoint_before_http_request(self):
+        self.orchestrator.llm_api_url = "http://169.254.169.254/latest/meta-data"
+        self.orchestrator.llm_host_allowlist = ("169.254.169.254",)
+        self.orchestrator.no_proxy_hosts = ("169.254.169.254",)
+
+        with patch("httpx.AsyncClient.post") as mock_post:
+            with self.assertRaises(NeedsHumanError) as context:
+                await self.orchestrator._call_llm("system", "user")
+
+        mock_post.assert_not_called()
+        self.assertIn("network policy", str(context.exception))
 
 
 if __name__ == "__main__":

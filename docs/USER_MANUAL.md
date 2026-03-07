@@ -96,6 +96,8 @@ Important behavior:
 - `GITHUB_OWNER`, `GITHUB_REPO`: fallback single-repo allowlist if `ALLOWED_REPOS` is empty.
 - `ALLOWED_REPOS`: comma-separated `owner/repo` allowlist.
 - `GITHUB_TOKEN`: token used for GitHub API operations and clone/push. The worker only exposes write credentials during publish/comment steps; quality gates run without write-token subprocess environment.
+- `LLM_API_URL`: worker LLM endpoint URL.
+- `LLM_HOST_ALLOWLIST`: comma-separated exact hosts or dot-prefixed suffixes allowed for `LLM_API_URL`.
 
 Allowlist behavior:
 
@@ -141,6 +143,13 @@ Current execution model uses Docker socket access from webhook service. Treat ho
 
 Default Squid config allows GitHub domains only.
 
+Important behavior:
+
+- Public `LLM_API_URL` hosts must be in `LLM_HOST_ALLOWLIST`, must not appear in `WORKER_NO_PROXY`, and must be present in Squid `allowed_domains`.
+- Private or loopback `LLM_API_URL` hosts must be in `LLM_HOST_ALLOWLIST` and must appear in `WORKER_NO_PROXY`.
+- Metadata and link-local targets are blocked.
+- Compose maps `host.docker.internal` into the webhook container, and worker containers receive the same host-gateway alias for local-host LLM routes.
+
 ### 4.7 Agent quality and policy controls
 
 - `AGENT_MAX_CHANGED_FILES`
@@ -158,6 +167,7 @@ Important behavior:
 - LLM plan responses must include a non-empty `summary`.
 - LLM edit responses may contain only `summary` and `edits`.
 - Invalid or policy-violating LLM output is escalated to `needs_human` before any file edit is applied.
+- LLM endpoint network policy is enforced both at startup and inside the worker before outbound LLM requests.
 
 ## 5. GitHub Webhook Setup
 
@@ -342,6 +352,8 @@ Check:
 - `DEPLOYMENT_ENV=production` is not combined with empty secret.
 - `WEBHOOK_MAX_BODY_BYTES` is large enough for expected GitHub payload sizes.
 - `WEBHOOK_RATE_LIMIT_*` is sized for expected webhook bursts.
+- `LLM_HOST_ALLOWLIST` contains the configured LLM hostname.
+- Public LLM hosts are not listed in `WORKER_NO_PROXY`; private/local LLM hosts are.
 - `ALLOWED_REPOS` and repository name formatting (`owner/repo`).
 - Event type/action is in supported matrix.
 - Duplicate delivery IDs are not being replayed.
@@ -383,6 +395,7 @@ Check:
 - Docker daemon/socket accessibility.
 - Proxy egress to GitHub (`DEEP_HEALTH_GITHUB_URL`).
 - Optional LLM endpoint availability if enabled in deep health.
+- Squid `allowed_domains`, `LLM_HOST_ALLOWLIST`, and `WORKER_NO_PROXY` agree on whether the LLM route is proxied or direct.
 
 ## 11. Security Hardening Checklist
 

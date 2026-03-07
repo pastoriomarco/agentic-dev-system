@@ -26,14 +26,16 @@ This backlog is re-evaluated for:
   - `Rank 8 / P0` Deliver the minimum valid PR-aware path: same-repo PR issue comments with explicit `@agent`/`@ai` trigger, PR head/base binding, task-level approvals, update-in-place on the PR branch, and stale-task handling on `pull_request.synchronize`.
   - `Rank 9 / P0` Recover orphaned `processing` tasks to `needs_human` on startup.
   - `Rank 10 / P0` Enforce strict LLM output schema + action/path policy validation before any file edit.
-- Next up:
   - `Rank 11 / P0` Align egress controls (`proxy` allowlist + `NO_PROXY`) and add explicit `LLM_HOST_ALLOWLIST` config validation.
   - `Rank 12 / P0` Add SSRF/internal network containment: block link-local, metadata, and RFC1918 destinations by default.
+- Next up:
   - `Rank 13 / P0` Run worker containers as non-root by default (keep existing read-only/caps-drop hardening).
+  - `Rank 8 / P0` Expand PR-aware execution beyond the V1 path: review comments, review bodies, richer comment location context, and fork-safe handling.
+  - `Rank 9 / P0` Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion.
 
 ## Prioritized Backlog (Highest to Lowest)
 
-The table below keeps the original ranking for traceability. Items listed in `Completed` above are already delivered; the active backlog now starts with the remaining follow-on scope in Ranks 8, 9, and 11+.
+The table below keeps the original ranking for traceability. Items listed in `Completed` above are already delivered; the active backlog now starts with Rank 13 plus the remaining follow-on scope in Ranks 8 and 9.
 
 | Rank | Priority | Improvement | Impact | Complexity | Why this priority |
 |---|---|---|---|---|---|
@@ -47,8 +49,8 @@ The table below keeps the original ranking for traceability. Items listed in `Co
 | 8 | P0 | Expand PR-aware execution beyond the V1 path: review comments, review bodies, richer comment location context, and fork-safe handling | Very High | Medium-High | The core same-repo PR issue-comment path exists now, but review-driven automation and fork safety still need a complete design. |
 | 9 | P0 | Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion | Very High | Medium | Restart recovery now preserves task state, but worker/container cleanup and session/artifact reconciliation are still incomplete. |
 | 10 | P0 | Enforce strict LLM output schema + action/path policy validation before any file edit | Very High | Medium | Delivered. Malformed or policy-violating LLM edit payloads now halt in `needs_human` before any workspace mutation. |
-| 11 | P0 | Align egress controls (`proxy` allowlist + `NO_PROXY`) and add explicit `LLM_HOST_ALLOWLIST` config validation | High | Low | Prevents accidental over-permissive routing and broken LLM connectivity caused by config drift. |
-| 12 | P0 | Add SSRF/internal network containment: block link-local, metadata, and RFC1918 destinations by default | High | Medium | Limits lateral movement/data access if prompts or dependencies attempt internal network access. |
+| 11 | P0 | Align egress controls (`proxy` allowlist + `NO_PROXY`) and add explicit `LLM_HOST_ALLOWLIST` config validation | High | Low | Delivered. Startup now validates whether the configured LLM host must route directly or through Squid and rejects drift between allowlist, proxy, and `NO_PROXY`. |
+| 12 | P0 | Add SSRF/internal network containment: block link-local, metadata, and RFC1918 destinations by default | High | Medium | Delivered. Worker LLM requests now reject metadata/link-local targets and unintended private-network routes before making outbound HTTP calls. |
 | 13 | P0 | Run worker containers as non-root by default (keep existing read-only/caps-drop hardening) | High | Low | High-value isolation improvement with minimal operational overhead. |
 | 14 | P1 | Use GitHub App installation tokens with minimal repo-scoped permissions; split read/write credentials | High | Medium | Reduces credential blast radius and aligns permissions with allowlisted repos. |
 | 15 | P1 | Add clone transport policy: enforce HTTPS clone URL by default; reject unsupported SSH/private URL modes unless explicitly configured | High | Low-Medium | Prevents clone/push failures and hidden auth mismatches, especially for private repos. |

@@ -65,6 +65,7 @@ services:
       - DEEP_HEALTH_CHECK_LLM=${DEEP_HEALTH_CHECK_LLM:-false}
       - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:8080/v1/chat/completions}
       - LLM_MODEL=${LLM_MODEL:-qwen3-coder-next}
+      - LLM_HOST_ALLOWLIST=${LLM_HOST_ALLOWLIST:-localhost,host.docker.internal}
       - DATABASE_URL=${DATABASE_URL:-sqlite:///agent_queue.db}
     ports:
       - "8000:8000"
@@ -72,6 +73,8 @@ services:
       - ./logs:/app/logs
       - /var/run/docker.sock:/var/run/docker.sock
       - worker-artifacts:/worker-artifacts
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     networks:
       - app_net

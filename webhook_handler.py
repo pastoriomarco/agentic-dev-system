@@ -21,6 +21,15 @@ from docker.client import DockerClient
 from docker.types import Mount
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from network_policy import (
+    NetworkPolicyError,
+    host_allowed_by_squid,
+    load_squid_allowed_domains,
+    parse_host_patterns,
+    parse_proxy_url,
+    validate_llm_endpoint,
+    validate_public_http_url,
+)
 from redis.asyncio import Redis
 
 # Configuration
@@ -53,7 +62,10 @@ WORKER_ARTIFACTS_VOLUME = os.environ.get("WORKER_ARTIFACTS_VOLUME", "worker-arti
 WORKER_VOLUME_PREFIX = os.environ.get("WORKER_VOLUME_PREFIX", "agent-task")
 WORKER_HTTP_PROXY = os.environ.get("WORKER_HTTP_PROXY", "http://egress-proxy:3128")
 WORKER_HTTPS_PROXY = os.environ.get("WORKER_HTTPS_PROXY", "http://egress-proxy:3128")
-WORKER_NO_PROXY = os.environ.get("WORKER_NO_PROXY", "localhost,127.0.0.1,egress-proxy,redis")
+WORKER_NO_PROXY = os.environ.get("WORKER_NO_PROXY", "localhost,127.0.0.1,host.docker.internal,egress-proxy,redis")
+LLM_API_URL = os.environ.get("LLM_API_URL", "").strip()
+LLM_MODEL = os.environ.get("LLM_MODEL", "").strip()
+LLM_HOST_ALLOWLIST_RAW = os.environ.get("LLM_HOST_ALLOWLIST", "localhost,host.docker.internal").strip()
 DEEP_HEALTH_TIMEOUT_SECONDS = float(os.environ.get("DEEP_HEALTH_TIMEOUT_SECONDS", "8"))
 DEEP_HEALTH_GITHUB_URL = os.environ.get("DEEP_HEALTH_GITHUB_URL", "https://api.github.com/meta")
 DEEP_HEALTH_CHECK_LLM = os.environ.get("DEEP_HEALTH_CHECK_LLM", "false").lower() == "true"
@@ -135,6 +147,7 @@ PROJECTION_STATUS_PRIORITY = {
     "queued": 4,
 }
 PR_AGENT_TRIGGER_KEYWORDS = ["@agent", "@ai"]
+SQUID_CONFIG_PATH = Path(__file__).resolve().parent / "proxy" / "squid.conf"
 
 
 class PayloadTooLargeError(Exception):
@@ -210,6 +223,24 @@ def validate_runtime_configuration() -> None:
     for name, value in positive_limits.items():
         if value <= 0:
             raise RuntimeError(f"{name} must be greater than zero.")
+    try:
+        parse_proxy_url(WORKER_HTTP_PROXY, context="WORKER_HTTP_PROXY")
+        parse_proxy_url(WORKER_HTTPS_PROXY, context="WORKER_HTTPS_PROXY")
+        validate_public_http_url(DEEP_HEALTH_GITHUB_URL, context="DEEP_HEALTH_GITHUB_URL")
+        if LLM_API_URL:
+            llm_decision = validate_llm_endpoint(
+                LLM_API_URL,
+                allowlisted_hosts=parse_host_patterns(LLM_HOST_ALLOWLIST_RAW),
+                no_proxy_hosts=parse_host_patterns(WORKER_NO_PROXY),
+            )
+            if llm_decision.route == "proxy":
+                squid_domains = load_squid_allowed_domains(SQUID_CONFIG_PATH)
+                if not host_allowed_by_squid(llm_decision.host, squid_domains):
+                    raise RuntimeError(
+                        f"LLM_API_URL host '{llm_decision.host}' is not allowed by proxy/squid.conf allowed_domains."
+                    )
+    except NetworkPolicyError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 async def get_redis() -> Redis:
@@ -757,8 +788,9 @@ def _run_worker_container(task: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
             "GITHUB_WRITE_TOKEN": GITHUB_TOKEN,
             "TARGET_REPO_URL": repo_url,
             "GITHUB_BASE_BRANCH": os.environ.get("GITHUB_BASE_BRANCH", "main"),
-            "LLM_API_URL": os.environ.get("LLM_API_URL", ""),
-            "LLM_MODEL": os.environ.get("LLM_MODEL", ""),
+            "LLM_API_URL": LLM_API_URL,
+            "LLM_MODEL": LLM_MODEL,
+            "LLM_HOST_ALLOWLIST": LLM_HOST_ALLOWLIST_RAW,
             "HTTP_PROXY": WORKER_HTTP_PROXY,
             "HTTPS_PROXY": WORKER_HTTPS_PROXY,
             "ALL_PROXY": WORKER_HTTPS_PROXY,
@@ -777,6 +809,7 @@ def _run_worker_container(task: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
             network=WORKER_NETWORK,
             detach=True,
             user="0:0",
+            extra_hosts={"host.docker.internal": "host-gateway"},
             read_only=True,
             tmpfs={"/tmp": "rw,noexec,nosuid,size=256m"},
             mem_limit=WORKER_MEMORY_LIMIT,
@@ -1300,9 +1333,16 @@ async def health_deep() -> JSONResponse:
     checks.append(await _check_http_url("proxy_to_github", DEEP_HEALTH_GITHUB_URL, use_proxy=True, required=True))
 
     # Optional LLM endpoint check.
-    llm_url = os.environ.get("LLM_API_URL", "").strip()
-    if llm_url and DEEP_HEALTH_CHECK_LLM:
-        checks.append(await _check_http_url("llm_endpoint", llm_url, use_proxy=False, required=False))
+    if LLM_API_URL and DEEP_HEALTH_CHECK_LLM:
+        try:
+            llm_route = validate_llm_endpoint(
+                LLM_API_URL,
+                allowlisted_hosts=parse_host_patterns(LLM_HOST_ALLOWLIST_RAW),
+                no_proxy_hosts=parse_host_patterns(WORKER_NO_PROXY),
+            )
+            checks.append(await _check_http_url("llm_endpoint", LLM_API_URL, use_proxy=llm_route.route == "proxy", required=False))
+        except NetworkPolicyError as exc:
+            checks.append({"name": "llm_endpoint", "ok": False, "error": str(exc), "url": LLM_API_URL, "required": False})
 
     ok = all(item.get("ok", False) for item in checks if item.get("required", True))
     status_code = 200 if ok else 503

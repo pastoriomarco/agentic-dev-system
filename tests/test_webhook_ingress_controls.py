@@ -1,10 +1,16 @@
 import hashlib
 import hmac
+import ipaddress
 import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import httpx
 
+import network_policy
 import webhook_handler as wh
 
 
@@ -84,6 +90,11 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         self.orig_rate_limit_window_seconds = wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS
         self.orig_rate_limit_global_max = wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX
         self.orig_rate_limit_repo_max = wh.WEBHOOK_RATE_LIMIT_REPO_MAX
+        self.orig_llm_api_url = wh.LLM_API_URL
+        self.orig_llm_host_allowlist_raw = wh.LLM_HOST_ALLOWLIST_RAW
+        self.orig_worker_no_proxy = wh.WORKER_NO_PROXY
+        self.orig_deep_health_github_url = wh.DEEP_HEALTH_GITHUB_URL
+        self.orig_squid_config_path = wh.SQUID_CONFIG_PATH
 
         wh.redis_client = FakeRedis()
         wh.WEBHOOK_SECRET = "test-secret"
@@ -94,6 +105,13 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = 60
         wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX = 120
         wh.WEBHOOK_RATE_LIMIT_REPO_MAX = 60
+        wh.LLM_API_URL = ""
+        wh.LLM_HOST_ALLOWLIST_RAW = "localhost,host.docker.internal"
+        wh.WORKER_NO_PROXY = "localhost,127.0.0.1,host.docker.internal,egress-proxy,redis"
+        wh.DEEP_HEALTH_GITHUB_URL = "https://api.github.com/meta"
+
+        self.resolve_patcher = patch("network_policy.resolve_hostname_ips", side_effect=self._fake_resolve_hostname_ips)
+        self.resolve_patcher.start()
 
     async def asyncTearDown(self):
         wh.RUNTIME_ENV = self.orig_runtime_env
@@ -106,6 +124,24 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = self.orig_rate_limit_window_seconds
         wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX = self.orig_rate_limit_global_max
         wh.WEBHOOK_RATE_LIMIT_REPO_MAX = self.orig_rate_limit_repo_max
+        wh.LLM_API_URL = self.orig_llm_api_url
+        wh.LLM_HOST_ALLOWLIST_RAW = self.orig_llm_host_allowlist_raw
+        wh.WORKER_NO_PROXY = self.orig_worker_no_proxy
+        wh.DEEP_HEALTH_GITHUB_URL = self.orig_deep_health_github_url
+        wh.SQUID_CONFIG_PATH = self.orig_squid_config_path
+        self.resolve_patcher.stop()
+
+    def _fake_resolve_hostname_ips(self, host: str):
+        normalized = host.strip().lower().strip("[]")
+        mapping = {
+            "api.github.com": (ipaddress.ip_address("140.82.121.6"),),
+            "localhost": (ipaddress.ip_address("127.0.0.1"),),
+            "host.docker.internal": (ipaddress.ip_address("192.168.65.2"),),
+            "api.example.com": (ipaddress.ip_address("93.184.216.34"),),
+        }
+        if normalized in mapping:
+            return mapping[normalized]
+        return (ipaddress.ip_address(normalized),)
 
     def _signed_headers(self, payload: bytes, delivery_id: str, event: str = "issues") -> dict:
         digest = hmac.new(wh.WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
@@ -129,6 +165,30 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
 
         wh.ADMIN_API_TOKEN = "set"
         wh.validate_runtime_configuration()
+
+    async def test_runtime_configuration_rejects_public_llm_host_outside_squid_allowlist(self):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write("acl allowed_domains dstdomain \\\n  .github.com\n")
+            squid_path = handle.name
+        self.addCleanup(lambda: os.unlink(squid_path))
+
+        wh.LLM_API_URL = "https://api.example.com/v1/chat/completions"
+        wh.LLM_HOST_ALLOWLIST_RAW = "api.example.com"
+        wh.WORKER_NO_PROXY = "localhost,127.0.0.1,host.docker.internal,egress-proxy,redis"
+        wh.SQUID_CONFIG_PATH = Path(squid_path)
+
+        with self.assertRaises(RuntimeError) as context:
+            wh.validate_runtime_configuration()
+        self.assertIn("not allowed by proxy/squid.conf", str(context.exception))
+
+    async def test_runtime_configuration_rejects_private_llm_host_without_no_proxy(self):
+        wh.LLM_API_URL = "http://host.docker.internal:8080/v1/chat/completions"
+        wh.LLM_HOST_ALLOWLIST_RAW = "host.docker.internal"
+        wh.WORKER_NO_PROXY = "localhost,127.0.0.1,egress-proxy,redis"
+
+        with self.assertRaises(RuntimeError) as context:
+            wh.validate_runtime_configuration()
+        self.assertIn("must be listed in WORKER_NO_PROXY", str(context.exception))
 
     async def test_signature_verification_fails_closed_without_secret_in_production(self):
         wh.RUNTIME_ENV = "production"

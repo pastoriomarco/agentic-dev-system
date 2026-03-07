@@ -46,6 +46,7 @@ Edit `.env` with real values:
 - `ALLOWED_REPOS` (recommended for multi-repo safety)
 - `MAX_RETRIES`, `RETRY_BASE_DELAY_SECONDS`, `RETRY_MAX_DELAY_SECONDS`, `RETRY_POLL_INTERVAL_SECONDS`
 - `WORKER_*` limits (CPU/memory/pids/timeout/image/network)
+- `LLM_API_URL`, `LLM_MODEL`, `LLM_HOST_ALLOWLIST`
 - `AGENT_*` controls for changed-file policy, diff policy, quality gates, and `AGENT_MAX_EDIT_ACTIONS`
 - `AGENT_PERMISSIONS_FILE` for explicit runtime permission context
 
@@ -65,6 +66,7 @@ In target repository settings:
 - Events: `issues`, `issue_comment`, `pull_request`
 - Supported actions: `issues.opened`, `issues.edited`, `issues.reopened`, `issue_comment.created`, `pull_request.synchronize`
 - Oversize webhook bodies are rejected with `413 payload_too_large`; fixed-window ingress throttling returns `429 rate_limited`.
+- Public LLM hosts must be in `LLM_HOST_ALLOWLIST` and reachable through the Squid `allowed_domains` proxy path; private/local LLM hosts must also be present in `WORKER_NO_PROXY`.
 - Issue comments on pull requests create a task only when they are on a same-repo PR and contain an explicit `@agent` or `@ai` trigger.
 - PR review events and review comments are still ignored.
 
@@ -164,6 +166,7 @@ Queue key format:
 - In `production`, startup also fails if `ADMIN_API_TOKEN` is empty.
 - Webhook delivery IDs (`X-GitHub-Delivery`) are deduplicated in Redis to prevent replay/duplicate processing.
 - `/webhook/github` enforces a request body cap and Redis-backed fixed-window rate limits before task creation.
+- Startup validates `LLM_API_URL`, `LLM_HOST_ALLOWLIST`, proxy URLs, `WORKER_NO_PROXY`, and Squid `allowed_domains` so public and private LLM routes cannot drift silently.
 - Failed runs are retried with exponential backoff and moved to dead-letter after max retries.
 - Tasks left in `processing` across a service restart are moved to `needs_human` for manual review.
 - Supported PR tasks are bound to the PR head SHA; `pull_request.synchronize` or any head movement before publish moves the task to `needs_human`.
@@ -174,6 +177,7 @@ Queue key format:
 - LLM plan/edit responses are schema-validated; malformed or policy-violating edit payloads halt in `needs_human` before any file mutation.
 - Commit is blocked unless quality gates pass and policy checks pass (changed file count, diff size, forbidden paths).
 - For PR tasks, quality-gate subprocesses run without GitHub write credentials and edits are constrained to the PR's changed files.
+- Link-local, metadata, and unintended private-network LLM destinations are blocked by network policy before any worker HTTP request is made.
 - Agent permissions are explicitly provided from `AGENT_PERMISSIONS.md` and injected into LLM system prompts.
 - GitHub issue status is signaled automatically via labels and comments (default labels):
 : `agent:queued`, `agent:in-progress`, `agent:needs-human`, `agent:pr-opened`, `agent:failed`, `agent:dead-letter`, `agent:rejected`

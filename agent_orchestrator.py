@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
+from network_policy import NetworkPolicyError, parse_host_patterns, validate_llm_endpoint
 
 
 class NeedsHumanError(Exception):
@@ -68,6 +69,8 @@ class AgentOrchestrator:
 
         self.llm_api_url = os.environ.get("LLM_API_URL", "http://localhost:8080/v1/chat/completions")
         self.llm_model = os.environ.get("LLM_MODEL", "qwen3-coder-next")
+        self.llm_host_allowlist = parse_host_patterns(os.environ.get("LLM_HOST_ALLOWLIST", "localhost,host.docker.internal"))
+        self.no_proxy_hosts = parse_host_patterns(os.environ.get("WORKER_NO_PROXY", "localhost,127.0.0.1,host.docker.internal"))
         self.base_branch = os.environ.get("GITHUB_BASE_BRANCH", "main")
 
         self.max_changed_files = int(os.environ.get("AGENT_MAX_CHANGED_FILES", "20"))
@@ -329,6 +332,14 @@ class AgentOrchestrator:
         return "\n".join(lines[:max_lines])
 
     async def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
+        try:
+            validate_llm_endpoint(
+                self.llm_api_url,
+                allowlisted_hosts=self.llm_host_allowlist,
+                no_proxy_hosts=self.no_proxy_hosts,
+            )
+        except NetworkPolicyError as exc:
+            raise NeedsHumanError(f"LLM endpoint blocked by network policy: {exc}") from exc
         full_system_prompt = (
             system_prompt.strip()
             + "\n\nRuntime permissions and constraints:\n"
