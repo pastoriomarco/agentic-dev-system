@@ -18,6 +18,7 @@ from urllib.parse import quote
 import httpx
 from docker import from_env as docker_from_env
 from docker.client import DockerClient
+from docker.errors import NotFound
 from docker.types import Mount
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -104,6 +105,10 @@ ISSUE_TASKS_INDEX_PREFIX = "issue:tasks:"
 TASK_RETRY_INDEX_KEY = "tasks:retry:index"
 WEBHOOK_RATE_LIMIT_GLOBAL_KEY_PREFIX = "webhook:rate:global:"
 WEBHOOK_RATE_LIMIT_REPO_KEY_PREFIX = "webhook:rate:repo:"
+WORKER_LABEL_KEY = "agentic.dev-system.worker"
+WORKER_JOB_LABEL_KEY = "agentic.dev-system.job-id"
+WORKER_TASK_LABEL_KEY = "agentic.dev-system.task-id"
+WORKER_QUEUE_LABEL_KEY = "agentic.dev-system.queue-key"
 
 SUPPORTED_WEBHOOK_ACTIONS: Dict[str, set[str]] = {
     "issues": {"opened", "edited", "reopened"},
@@ -546,6 +551,152 @@ async def list_sessions() -> List[Dict[str, Any]]:
     return [json.loads(v) for v in values if v]
 
 
+def _load_worker_artifact_payload(task: Dict[str, Any]) -> tuple[Dict[str, Any] | None, str | None]:
+    runtime = _worker_runtime_metadata(task)
+    artifact_path = runtime["artifact_host_path"]
+    if not artifact_path.exists():
+        return None, None
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"Failed reading worker artifact {artifact_path.name}: {exc}"
+    if not isinstance(payload, dict):
+        return None, f"Worker artifact {artifact_path.name} did not contain a JSON object."
+    return payload, None
+
+
+async def _finalize_task_session(
+    task: Dict[str, Any],
+    session_data: Dict[str, Any],
+    worker_logs: str = "",
+    *,
+    recovered: bool = False,
+) -> Dict[str, Any] | None:
+    queue_key = task["queue_key"]
+    session_data.setdefault("session_id", str(uuid.uuid4()))
+    session_data.setdefault("created_at", now_utc().isoformat())
+    session_data.setdefault("status", "failed")
+    if worker_logs:
+        logs = session_data.get("logs") or []
+        logs.append(worker_logs[-4000:])
+        session_data["logs"] = logs
+
+    await store_session(session_data, session_data["created_at"])
+    completed_at = now_utc().isoformat()
+    output_pr = {
+        "number": session_data.get("output_pr_number"),
+        "url": session_data.get("output_pr_url"),
+    }
+    status_prefix = "Recovered agent task" if recovered else "Agent task"
+    issue_prefix = "Recovered agent" if recovered else "Agent"
+
+    if session_data.get("status") == "completed":
+        task, issue = await transition_task(
+            queue_key,
+            task,
+            "completed",
+            preferred_task_id=task["task_id"],
+            assigned_agent=session_data["session_id"],
+            completed_at=completed_at,
+            output_pr=output_pr,
+            next_retry_at=None,
+            last_error=None,
+            errors=session_data.get("errors", []),
+        )
+        pr_url = output_pr.get("url")
+        if issue:
+            if pr_url:
+                if task.get("subject_kind") == "pull_request":
+                    message = f"{issue_prefix} updated pull request task `{task['task_id']}` successfully: {pr_url}"
+                else:
+                    message = f"{issue_prefix} completed successfully. PR created: {pr_url}"
+                await _post_issue_comment(issue["repo_full_name"], issue["issue_number"], message)
+            else:
+                await _post_issue_comment(
+                    issue["repo_full_name"],
+                    issue["issue_number"],
+                    f"{issue_prefix} completed successfully.",
+                )
+            await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+        return issue
+
+    if session_data.get("status") == "needs_human":
+        errors = session_data.get("errors") or ["Agent run requires human review."]
+        task, issue = await transition_task(
+            queue_key,
+            task,
+            "needs_human",
+            preferred_task_id=task["task_id"],
+            assigned_agent=session_data["session_id"],
+            completed_at=completed_at,
+            errors=errors,
+            last_error=errors[-1],
+            next_retry_at=None,
+            needs_human_at=now_utc().isoformat(),
+            needs_human_reason=errors[-1],
+            output_pr=output_pr,
+        )
+        if issue:
+            await _post_issue_comment(
+                issue["repo_full_name"],
+                issue["issue_number"],
+                f"{issue_prefix} moved task `{task['task_id']}` to needs-human review. Reason: {task['needs_human_reason']}",
+            )
+            await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+        return issue
+
+    errors = session_data.get("errors") or ["Agent run failed without explicit error message."]
+    attempts_used = int(task.get("attempt_count", 1))
+    retries_used = max(attempts_used - 1, 0)
+    if retries_used < MAX_RETRIES:
+        delay_seconds = compute_retry_delay_seconds(attempts_used)
+        retry_at = now_utc() + timedelta(seconds=delay_seconds)
+        task, issue = await transition_task(
+            queue_key,
+            task,
+            "queued_retry",
+            preferred_task_id=task["task_id"],
+            assigned_agent=session_data["session_id"],
+            completed_at=completed_at,
+            errors=errors,
+            last_error=errors[-1],
+            next_retry_at=retry_at.isoformat(),
+            output_pr=output_pr,
+        )
+        if issue:
+            await _post_issue_comment(
+                issue["repo_full_name"],
+                issue["issue_number"],
+                f"{status_prefix} `{task['task_id']}` attempt {attempts_used} failed. "
+                f"Scheduled retry at {task['next_retry_at']}. Last error: {task['last_error']}",
+            )
+            await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+        return issue
+
+    task, issue = await transition_task(
+        queue_key,
+        task,
+        "dead_letter",
+        preferred_task_id=task["task_id"],
+        assigned_agent=session_data["session_id"],
+        completed_at=completed_at,
+        errors=errors,
+        last_error=errors[-1],
+        next_retry_at=None,
+        dead_lettered_at=now_utc().isoformat(),
+        output_pr=output_pr,
+    )
+    if issue:
+        await _post_issue_comment(
+            issue["repo_full_name"],
+            issue["issue_number"],
+            f"{status_prefix} `{task['task_id']}` to dead-letter after {attempts_used} attempts. "
+            f"Last error: {task['last_error']}",
+        )
+        await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+    return issue
+
+
 def _parse_content_length(raw_value: str | None) -> int | None:
     if raw_value is None:
         return None
@@ -754,6 +905,28 @@ def _worker_container_extra_hosts() -> Dict[str, str] | None:
     return {WORKER_HOST_GATEWAY_NAME: "host-gateway"}
 
 
+def _worker_runtime_metadata(task: Dict[str, Any]) -> Dict[str, Any]:
+    job_id = (task.get("worker_job_id") or uuid.uuid4().hex).strip()
+    container_name = task.get("worker_container_name") or f"agent-worker-{job_id}"
+    workspace_volume_name = task.get("worker_workspace_volume") or f"{WORKER_VOLUME_PREFIX}-ws-{job_id}"
+    artifact_host_path = Path(task.get("worker_artifact_path") or (WORKER_ARTIFACTS_DIR / f"{job_id}.json"))
+    artifact_container_path = f"/artifacts/{artifact_host_path.name}"
+    labels = {
+        WORKER_LABEL_KEY: "true",
+        WORKER_JOB_LABEL_KEY: job_id,
+        WORKER_TASK_LABEL_KEY: task["task_id"],
+        WORKER_QUEUE_LABEL_KEY: task["queue_key"],
+    }
+    return {
+        "job_id": job_id,
+        "container_name": container_name,
+        "workspace_volume_name": workspace_volume_name,
+        "artifact_host_path": artifact_host_path,
+        "artifact_container_path": artifact_container_path,
+        "labels": labels,
+    }
+
+
 def _prepare_worker_mount_permissions(client: DockerClient, mounts: List[Mount]) -> None:
     init_container = None
     try:
@@ -785,16 +958,57 @@ def _prepare_worker_mount_permissions(client: DockerClient, mounts: List[Mount])
                 pass
 
 
+def _cleanup_worker_runtime_for_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    client = get_docker_client()
+    runtime = _worker_runtime_metadata(task)
+    logs_text = ""
+    container_removed = False
+    volume_removed = False
+
+    try:
+        container = client.containers.get(runtime["container_name"])
+    except NotFound:
+        container = None
+    if container is not None:
+        try:
+            logs_text = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+        except Exception:
+            logs_text = ""
+        try:
+            container.remove(force=True)
+            container_removed = True
+        except Exception as exc:
+            logs_text = (logs_text + f"\nContainer cleanup failed: {exc}").strip()
+
+    try:
+        volume = client.volumes.get(runtime["workspace_volume_name"])
+    except NotFound:
+        volume = None
+    if volume is not None:
+        try:
+            volume.remove(force=True)
+            volume_removed = True
+        except Exception as exc:
+            logs_text = (logs_text + f"\nWorkspace volume cleanup failed: {exc}").strip()
+
+    return {
+        "container_removed": container_removed,
+        "volume_removed": volume_removed,
+        "logs": logs_text[-4000:],
+    }
+
+
 def _run_worker_container(task: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
     """
     Run a one-off worker container and return (session_payload, logs).
     This function runs in a thread via asyncio.to_thread.
     """
     client = get_docker_client()
-    job_id = uuid.uuid4().hex
-    workspace_volume_name = f"{WORKER_VOLUME_PREFIX}-ws-{job_id}"
-    artifact_host_path = WORKER_ARTIFACTS_DIR / f"{job_id}.json"
-    artifact_container_path = f"/artifacts/{job_id}.json"
+    runtime = _worker_runtime_metadata(task)
+    job_id = runtime["job_id"]
+    workspace_volume_name = runtime["workspace_volume_name"]
+    artifact_host_path = runtime["artifact_host_path"]
+    artifact_container_path = runtime["artifact_container_path"]
     repo_url = build_repo_url(task["repo_full_name"], task.get("repo_clone_url", ""))
 
     session_payload: Dict[str, Any] = {
@@ -813,7 +1027,7 @@ def _run_worker_container(task: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
     try:
         if artifact_host_path.exists():
             artifact_host_path.unlink()
-        workspace_volume = client.volumes.create(name=workspace_volume_name)
+        workspace_volume = client.volumes.create(name=workspace_volume_name, labels=runtime["labels"])
         mounts = [
             Mount(target="/workspace", source=workspace_volume_name, type="volume", read_only=False),
             Mount(target="/artifacts", source=WORKER_ARTIFACTS_VOLUME, type="volume", read_only=False),
@@ -857,11 +1071,13 @@ def _run_worker_container(task: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
             "no_proxy": WORKER_NO_PROXY,
         }
         run_kwargs: Dict[str, Any] = {
+            "name": runtime["container_name"],
             "command": ["python", "worker_entrypoint.py"],
             "environment": env,
             "mounts": mounts,
             "network": WORKER_NETWORK,
             "detach": True,
+            "labels": runtime["labels"],
             "user": _worker_container_user(),
             "read_only": True,
             "tmpfs": {"/tmp": "rw,noexec,nosuid,size=256m"},
@@ -919,6 +1135,8 @@ async def run_agent_for_task(task_id: str) -> None:
 
         started_at = now_utc().isoformat()
         attempt_count = int(task.get("attempt_count", 0)) + 1
+        worker_job_id = uuid.uuid4().hex
+        runtime = _worker_runtime_metadata({"task_id": task["task_id"], "queue_key": queue_key, "worker_job_id": worker_job_id})
         task, issue = await transition_task(
             queue_key,
             task,
@@ -929,6 +1147,10 @@ async def run_agent_for_task(task_id: str) -> None:
             next_retry_at=None,
             needs_human_at=None,
             needs_human_reason=None,
+            worker_job_id=worker_job_id,
+            worker_container_name=runtime["container_name"],
+            worker_workspace_volume=runtime["workspace_volume_name"],
+            worker_artifact_path=str(runtime["artifact_host_path"]),
         )
         await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
         await _assign_issue(issue["repo_full_name"], issue["issue_number"])
@@ -939,115 +1161,7 @@ async def run_agent_for_task(task_id: str) -> None:
         )
 
         session_data, worker_logs = await asyncio.to_thread(_run_worker_container, task)
-        session_data.setdefault("session_id", str(uuid.uuid4()))
-        session_data.setdefault("created_at", now_utc().isoformat())
-        session_data.setdefault("status", "failed")
-        if worker_logs:
-            logs = session_data.get("logs") or []
-            logs.append(worker_logs[-4000:])
-            session_data["logs"] = logs
-
-        await store_session(session_data, session_data["created_at"])
-        completed_at = now_utc().isoformat()
-        output_pr = {
-            "number": session_data.get("output_pr_number"),
-            "url": session_data.get("output_pr_url"),
-        }
-        if session_data.get("status") == "completed":
-            task, issue = await transition_task(
-                queue_key,
-                task,
-                "completed",
-                preferred_task_id=task_id,
-                assigned_agent=session_data["session_id"],
-                completed_at=completed_at,
-                output_pr=output_pr,
-                next_retry_at=None,
-                last_error=None,
-                errors=session_data.get("errors", []),
-            )
-            pr_url = output_pr.get("url")
-            if pr_url:
-                if task.get("subject_kind") == "pull_request":
-                    message = f"Agent updated pull request task `{task['task_id']}` successfully: {pr_url}"
-                else:
-                    message = f"Agent completed successfully. PR created: {pr_url}"
-                await _post_issue_comment(issue["repo_full_name"], issue["issue_number"], message)
-            else:
-                await _post_issue_comment(
-                    issue["repo_full_name"],
-                    issue["issue_number"],
-                    "Agent completed successfully.",
-                )
-        else:
-            if session_data.get("status") == "needs_human":
-                errors = session_data.get("errors") or ["Agent run requires human review."]
-                task, issue = await transition_task(
-                    queue_key,
-                    task,
-                    "needs_human",
-                    preferred_task_id=task_id,
-                    assigned_agent=session_data["session_id"],
-                    completed_at=completed_at,
-                    errors=errors,
-                    last_error=errors[-1],
-                    next_retry_at=None,
-                    needs_human_at=now_utc().isoformat(),
-                    needs_human_reason=errors[-1],
-                    output_pr=output_pr,
-                )
-                await _post_issue_comment(
-                    issue["repo_full_name"],
-                    issue["issue_number"],
-                    f"Agent moved task `{task['task_id']}` to needs-human review. Reason: {task['needs_human_reason']}",
-                )
-                await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
-                return
-            errors = session_data.get("errors") or ["Agent run failed without explicit error message."]
-            attempts_used = int(task.get("attempt_count", 1))
-            retries_used = max(attempts_used - 1, 0)
-            if retries_used < MAX_RETRIES:
-                delay_seconds = compute_retry_delay_seconds(attempts_used)
-                retry_at = now_utc() + timedelta(seconds=delay_seconds)
-                task, issue = await transition_task(
-                    queue_key,
-                    task,
-                    "queued_retry",
-                    preferred_task_id=task_id,
-                    assigned_agent=session_data["session_id"],
-                    completed_at=completed_at,
-                    errors=errors,
-                    last_error=errors[-1],
-                    next_retry_at=retry_at.isoformat(),
-                    output_pr=output_pr,
-                )
-                await _post_issue_comment(
-                    issue["repo_full_name"],
-                    issue["issue_number"],
-                    f"Agent task `{task['task_id']}` attempt {attempts_used} failed. "
-                    f"Scheduled retry at {task['next_retry_at']}. Last error: {task['last_error']}",
-                )
-            else:
-                task, issue = await transition_task(
-                    queue_key,
-                    task,
-                    "dead_letter",
-                    preferred_task_id=task_id,
-                    assigned_agent=session_data["session_id"],
-                    completed_at=completed_at,
-                    errors=errors,
-                    last_error=errors[-1],
-                    next_retry_at=None,
-                    dead_lettered_at=now_utc().isoformat(),
-                    output_pr=output_pr,
-                )
-                await _post_issue_comment(
-                    issue["repo_full_name"],
-                    issue["issue_number"],
-                    f"Agent moved task `{task['task_id']}` to dead-letter after {attempts_used} attempts. "
-                    f"Last error: {task['last_error']}",
-                )
-        await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+        await _finalize_task_session(task, session_data, worker_logs)
 
 
 async def run_agent_for_issue(queue_key: str) -> None:
@@ -1317,34 +1431,51 @@ async def register_task_from_webhook(task: Dict[str, Any]) -> tuple[bool, Dict[s
     return created, issue
 
 
-async def recover_processing_tasks() -> int:
-    recovered = 0
-    affected_queue_keys: set[str] = set()
+async def reconcile_processing_tasks() -> Dict[str, int]:
+    stats = {
+        "task_count": 0,
+        "reingested_sessions": 0,
+        "needs_human": 0,
+        "containers_removed": 0,
+        "volumes_removed": 0,
+    }
     recovery_note = "Service restarted while this task was processing. Human review is required before resuming."
 
     for task in await list_all_tasks():
         if task.get("status") != "processing":
             continue
+        stats["task_count"] += 1
+        cleanup = await asyncio.to_thread(_cleanup_worker_runtime_for_task, task)
+        stats["containers_removed"] += int(bool(cleanup.get("container_removed")))
+        stats["volumes_removed"] += int(bool(cleanup.get("volume_removed")))
+
+        artifact_payload, artifact_error = _load_worker_artifact_payload(task)
+        if artifact_payload is not None:
+            await _finalize_task_session(task, artifact_payload, cleanup.get("logs", ""), recovered=True)
+            stats["reingested_sessions"] += 1
+            continue
+
         task["status"] = "needs_human"
         task["completed_at"] = now_utc().isoformat()
         task["needs_human_at"] = task["completed_at"]
-        task["needs_human_reason"] = recovery_note
+        task["needs_human_reason"] = recovery_note if not artifact_error else f"{recovery_note} {artifact_error}"
         errors = task.get("errors") or []
-        errors.append(recovery_note)
+        errors.append(task["needs_human_reason"])
         task["errors"] = errors[-10:]
-        task["last_error"] = recovery_note
+        task["last_error"] = task["needs_human_reason"]
         await store_task(task, create_only=False)
-        affected_queue_keys.add(task["queue_key"])
-        recovered += 1
+        issue = await sync_issue_projection(task["queue_key"])
+        if issue:
+            await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
+            await _post_issue_comment(issue["repo_full_name"], issue["issue_number"], task["needs_human_reason"])
+        stats["needs_human"] += 1
 
-    for queue_key in affected_queue_keys:
-        issue = await sync_issue_projection(queue_key)
-        if not issue:
-            continue
-        await _set_issue_status_label(issue["repo_full_name"], issue["issue_number"], issue["status"])
-        await _post_issue_comment(issue["repo_full_name"], issue["issue_number"], recovery_note)
+    return stats
 
-    return recovered
+
+async def recover_processing_tasks() -> int:
+    stats = await reconcile_processing_tasks()
+    return stats["task_count"]
 
 
 @app.get("/health")
@@ -1425,9 +1556,16 @@ async def startup_event() -> None:
     await redis.ping()
     await asyncio.to_thread(get_docker_client().ping)
     WORKER_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    recovered = await recover_processing_tasks()
-    if recovered:
-        print(f"Recovered {recovered} orphaned processing task(s) into needs_human state.")
+    recovery_stats = await reconcile_processing_tasks()
+    if recovery_stats["task_count"]:
+        print(
+            "Recovered processing task state on startup: "
+            f"tasks={recovery_stats['task_count']}, "
+            f"reingested_sessions={recovery_stats['reingested_sessions']}, "
+            f"needs_human={recovery_stats['needs_human']}, "
+            f"containers_removed={recovery_stats['containers_removed']}, "
+            f"volumes_removed={recovery_stats['volumes_removed']}."
+        )
     retry_worker_task = asyncio.create_task(retry_worker_loop())
 
 

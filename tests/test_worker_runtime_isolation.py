@@ -40,7 +40,7 @@ class FakeVolumes:
     def __init__(self):
         self.created: list[FakeVolume] = []
 
-    def create(self, name: str):
+    def create(self, name: str, labels=None):
         volume = FakeVolume(name)
         self.created.append(volume)
         return volume

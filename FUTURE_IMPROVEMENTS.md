@@ -30,9 +30,9 @@ This backlog is re-evaluated for:
   - `Rank 12 / P0` Add scoped outbound endpoint validation for LLM/deep-health URLs: block metadata/link-local targets and reject unintended private-network routing for configured service endpoints.
   - `Rank 30 / P0` Make worker host-gateway exposure opt-in; inject `host.docker.internal` and direct-route bypass only for explicit local-host LLM mode.
   - `Rank 13 / P0` Run worker containers as non-root by default after a short-lived root-owned mount-permission prep step.
-- Next up:
-  - `Recommended next session / P0` Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion.
   - `Rank 9 / P0` Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion.
+- Next up:
+  - `Recommended next session / P0` Expand PR-aware execution beyond the V1 path: review comments, review bodies, richer comment location context, and fork-safe handling.
   - `Rank 8 / P0` Expand PR-aware execution beyond the V1 path: review comments, review bodies, richer comment location context, and fork-safe handling.
 
 ## Backlog By Priority Level
@@ -49,7 +49,7 @@ The table below is ordered by `Priority` first. Original rank references are pre
 | 6 | P0 | Split immutable task records from mutable issue state; key work by delivery/task ID, not only `owner:repo:issue_number` | Very High | Medium | Delivered. New events no longer overwrite the exact approved/dead-letter work item or erase task history. |
 | 7 | P0 | Make state machine explicit and documented; validate legal transitions and add `agent:needs-human` halt state | Very High | Low-Medium | Delivered. Invalid manual actions and repeated autonomous failures now have a controlled halt path. |
 | 8 | P0 | Expand PR-aware execution beyond the V1 path: review comments, review bodies, richer comment location context, and fork-safe handling | Very High | Medium-High | The core same-repo PR issue-comment path exists now, but review-driven automation and fork safety still need a complete design. |
-| 9 | P0 | Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion | Very High | Medium | Restart recovery now preserves task state, but worker/container cleanup and session/artifact reconciliation are still incomplete. |
+| 9 | P0 | Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion | Very High | Medium | Delivered. Startup now re-ingests finished worker session artifacts when available and cleans up orphaned worker containers/volumes for tasks left in `processing`. |
 | 10 | P0 | Enforce strict LLM output schema + action/path policy validation before any file edit | Very High | Medium | Delivered. Malformed or policy-violating LLM edit payloads now halt in `needs_human` before any workspace mutation. |
 | 11 | P0 | Align egress controls (`proxy` allowlist + `NO_PROXY`) and add explicit `LLM_HOST_ALLOWLIST` config validation | High | Low | Delivered. Startup now validates whether the configured LLM host must route directly or through Squid and rejects drift between allowlist, proxy, and `NO_PROXY`. |
 | 12 | P0 | Add scoped outbound endpoint validation for configured LLM/deep-health URLs | High | Medium | Delivered. Startup and worker LLM calls now reject metadata/link-local targets and unintended private-network routing for configured service endpoints, but arbitrary subprocess egress is still a separate concern. |

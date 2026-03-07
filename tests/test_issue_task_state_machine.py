@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+import tempfile
 
 from fastapi import BackgroundTasks, HTTPException
 
@@ -95,15 +97,27 @@ class IssueTaskStateMachineTest(unittest.IsolatedAsyncioTestCase):
         self.orig_redis_client = wh.redis_client
         self.orig_admin_token = wh.ADMIN_API_TOKEN
         self.orig_github_token = wh.GITHUB_TOKEN
+        self.orig_cleanup_worker_runtime = wh._cleanup_worker_runtime_for_task
+        self.orig_worker_artifacts_dir = wh.WORKER_ARTIFACTS_DIR
+        self.tempdir = tempfile.TemporaryDirectory()
 
         wh.redis_client = FakeRedis()
         wh.ADMIN_API_TOKEN = "admin-token"
         wh.GITHUB_TOKEN = ""
+        wh._cleanup_worker_runtime_for_task = lambda _task: {
+            "container_removed": False,
+            "volume_removed": False,
+            "logs": "",
+        }
+        wh.WORKER_ARTIFACTS_DIR = Path(self.tempdir.name)
 
     async def asyncTearDown(self):
         wh.redis_client = self.orig_redis_client
         wh.ADMIN_API_TOKEN = self.orig_admin_token
         wh.GITHUB_TOKEN = self.orig_github_token
+        wh._cleanup_worker_runtime_for_task = self.orig_cleanup_worker_runtime
+        wh.WORKER_ARTIFACTS_DIR = self.orig_worker_artifacts_dir
+        self.tempdir.cleanup()
 
     async def test_invalid_transition_is_rejected_by_admin_endpoint(self):
         queue_key = "pastoriomarco:agentic-dev-system:11"
@@ -130,6 +144,40 @@ class IssueTaskStateMachineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(issue["status"], "needs_human")
         self.assertEqual(current_task["status"], "needs_human")
         self.assertIn("Human review is required", current_task["needs_human_reason"])
+
+    async def test_processing_task_recovery_reingests_session_artifact(self):
+        queue_key = "pastoriomarco:agentic-dev-system:15"
+        task = make_task("delivery-15", queue_key, "processing", wh.now_utc().isoformat(), issue_number=15)
+        task["worker_job_id"] = "job-15"
+        runtime = wh._worker_runtime_metadata(task)
+        task["worker_container_name"] = runtime["container_name"]
+        task["worker_workspace_volume"] = runtime["workspace_volume_name"]
+        task["worker_artifact_path"] = str(runtime["artifact_host_path"])
+        runtime["artifact_host_path"].write_text(
+            '{"session_id":"session-15","status":"completed","created_at":"2026-03-07T12:00:00","output_pr_url":"https://github.com/pastoriomarco/agentic-dev-system/pull/15","logs":["done"]}',
+            encoding="utf-8",
+        )
+        wh._cleanup_worker_runtime_for_task = lambda _task: {
+            "container_removed": True,
+            "volume_removed": True,
+            "logs": "recovered logs",
+        }
+        await wh.store_task(task, create_only=False)
+        await wh.sync_issue_projection(queue_key)
+
+        stats = await wh.reconcile_processing_tasks()
+
+        issue, current_task = await wh.load_current_task_for_issue(queue_key)
+        sessions = await wh.list_sessions()
+        self.assertEqual(stats["task_count"], 1)
+        self.assertEqual(stats["reingested_sessions"], 1)
+        self.assertEqual(stats["containers_removed"], 1)
+        self.assertEqual(stats["volumes_removed"], 1)
+        self.assertEqual(issue["status"], "completed")
+        self.assertEqual(current_task["status"], "completed")
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["session_id"], "session-15")
+        self.assertIn("recovered logs", sessions[0]["logs"][-1])
 
     async def test_task_endpoint_can_approve_specific_pull_request_task(self):
         queue_key = "pastoriomarco:agentic-dev-system:14"

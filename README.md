@@ -170,7 +170,7 @@ Queue key format:
 - Startup validates `LLM_API_URL`, `LLM_HOST_ALLOWLIST`, proxy URLs, `WORKER_NO_PROXY`, and Squid `allowed_domains` so public and private LLM routes cannot drift silently.
 - Startup also requires explicit `WORKER_ENABLE_HOST_GATEWAY=true` before a worker may route to `host.docker.internal`.
 - Failed runs are retried with exponential backoff and moved to dead-letter after max retries.
-- Tasks left in `processing` across a service restart are moved to `needs_human` for manual review.
+- On startup, tasks left in `processing` are reconciled by re-ingesting finished worker artifacts when present; otherwise orphaned worker containers/volumes are cleaned up and the task is moved to `needs_human`.
 - Supported PR tasks are bound to the PR head SHA; `pull_request.synchronize` or any head movement before publish moves the task to `needs_human`.
 - Each approved issue runs inside a short-lived worker container with:
 : read-only root filesystem, dropped Linux caps, no-new-privileges, CPU/memory/pids limits, dedicated per-task workspace volume, and non-root runtime UID/GID after a short root-owned mount-permission prep step.

@@ -388,7 +388,7 @@ Check:
 
 Check:
 
-- Whether the service restarted while a task was `processing`.
+- Whether the service restarted while a task was `processing` and no completed worker artifact was available for automatic re-ingestion.
 - Whether an operator attempted an invalid state transition.
 - Whether a pull request head SHA moved or the worker blocked an out-of-scope edit.
 - Whether the task should be manually reapproved with `/requeue` or replaced by a newer event/task.
