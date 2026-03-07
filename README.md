@@ -202,6 +202,10 @@ Queue key format:
 - LLM-generated edits can still fail on complex repos or ambiguous requirements; add repository-specific prompts/rules to improve reliability.
 - Domain-level allowlisting cannot guarantee single-repo access by itself; enforce single-repo scope with GitHub App/fine-grained token permissions.
 
+## License
+
+Apache License 2.0. See [LICENSE](./LICENSE).
+
 ## Next hardening steps
 
 See [FUTURE_IMPROVEMENTS.md](./FUTURE_IMPROVEMENTS.md) for the re-evaluated, prioritized roadmap (highest to lowest) with impact and complexity estimates.
