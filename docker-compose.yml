@@ -54,6 +54,9 @@ services:
       - WORKER_CPU_LIMIT=${WORKER_CPU_LIMIT:-1.0}
       - WORKER_MEMORY_LIMIT=${WORKER_MEMORY_LIMIT:-2g}
       - WORKER_PIDS_LIMIT=${WORKER_PIDS_LIMIT:-256}
+      - WORKER_RUN_AS_UID=${WORKER_RUN_AS_UID:-1000}
+      - WORKER_RUN_AS_GID=${WORKER_RUN_AS_GID:-1000}
+      - WORKER_ENABLE_HOST_GATEWAY=${WORKER_ENABLE_HOST_GATEWAY:-false}
       - WORKER_ARTIFACTS_DIR=${WORKER_ARTIFACTS_DIR:-/worker-artifacts}
       - WORKER_ARTIFACTS_VOLUME=${WORKER_ARTIFACTS_VOLUME:-worker-artifacts}
       - WORKER_VOLUME_PREFIX=${WORKER_VOLUME_PREFIX:-agent-task}
@@ -63,9 +66,9 @@ services:
       - DEEP_HEALTH_TIMEOUT_SECONDS=${DEEP_HEALTH_TIMEOUT_SECONDS:-8}
       - DEEP_HEALTH_GITHUB_URL=${DEEP_HEALTH_GITHUB_URL:-https://api.github.com/meta}
       - DEEP_HEALTH_CHECK_LLM=${DEEP_HEALTH_CHECK_LLM:-false}
-      - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:8080/v1/chat/completions}
+      - LLM_API_URL=${LLM_API_URL:-http://localhost:8080/v1/chat/completions}
       - LLM_MODEL=${LLM_MODEL:-qwen3-coder-next}
-      - LLM_HOST_ALLOWLIST=${LLM_HOST_ALLOWLIST:-localhost,host.docker.internal}
+      - LLM_HOST_ALLOWLIST=${LLM_HOST_ALLOWLIST:-localhost}
       - DATABASE_URL=${DATABASE_URL:-sqlite:///agent_queue.db}
     ports:
       - "8000:8000"

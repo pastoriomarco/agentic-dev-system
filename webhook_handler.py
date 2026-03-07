@@ -57,15 +57,18 @@ WORKER_TIMEOUT_SECONDS = int(os.environ.get("WORKER_TIMEOUT_SECONDS", "1800"))
 WORKER_CPU_LIMIT = float(os.environ.get("WORKER_CPU_LIMIT", "1.0"))
 WORKER_MEMORY_LIMIT = os.environ.get("WORKER_MEMORY_LIMIT", "2g")
 WORKER_PIDS_LIMIT = int(os.environ.get("WORKER_PIDS_LIMIT", "256"))
+WORKER_RUN_AS_UID = int(os.environ.get("WORKER_RUN_AS_UID", "1000"))
+WORKER_RUN_AS_GID = int(os.environ.get("WORKER_RUN_AS_GID", "1000"))
+WORKER_ENABLE_HOST_GATEWAY = os.environ.get("WORKER_ENABLE_HOST_GATEWAY", "false").lower() == "true"
 WORKER_ARTIFACTS_DIR = Path(os.environ.get("WORKER_ARTIFACTS_DIR", "/worker-artifacts"))
 WORKER_ARTIFACTS_VOLUME = os.environ.get("WORKER_ARTIFACTS_VOLUME", "worker-artifacts")
 WORKER_VOLUME_PREFIX = os.environ.get("WORKER_VOLUME_PREFIX", "agent-task")
 WORKER_HTTP_PROXY = os.environ.get("WORKER_HTTP_PROXY", "http://egress-proxy:3128")
 WORKER_HTTPS_PROXY = os.environ.get("WORKER_HTTPS_PROXY", "http://egress-proxy:3128")
-WORKER_NO_PROXY = os.environ.get("WORKER_NO_PROXY", "localhost,127.0.0.1,host.docker.internal,egress-proxy,redis")
+WORKER_NO_PROXY = os.environ.get("WORKER_NO_PROXY", "localhost,127.0.0.1,egress-proxy,redis")
 LLM_API_URL = os.environ.get("LLM_API_URL", "").strip()
 LLM_MODEL = os.environ.get("LLM_MODEL", "").strip()
-LLM_HOST_ALLOWLIST_RAW = os.environ.get("LLM_HOST_ALLOWLIST", "localhost,host.docker.internal").strip()
+LLM_HOST_ALLOWLIST_RAW = os.environ.get("LLM_HOST_ALLOWLIST", "localhost").strip()
 DEEP_HEALTH_TIMEOUT_SECONDS = float(os.environ.get("DEEP_HEALTH_TIMEOUT_SECONDS", "8"))
 DEEP_HEALTH_GITHUB_URL = os.environ.get("DEEP_HEALTH_GITHUB_URL", "https://api.github.com/meta")
 DEEP_HEALTH_CHECK_LLM = os.environ.get("DEEP_HEALTH_CHECK_LLM", "false").lower() == "true"
@@ -148,6 +151,7 @@ PROJECTION_STATUS_PRIORITY = {
 }
 PR_AGENT_TRIGGER_KEYWORDS = ["@agent", "@ai"]
 SQUID_CONFIG_PATH = Path(__file__).resolve().parent / "proxy" / "squid.conf"
+WORKER_HOST_GATEWAY_NAME = "host.docker.internal"
 
 
 class PayloadTooLargeError(Exception):
@@ -219,6 +223,8 @@ def validate_runtime_configuration() -> None:
         "WEBHOOK_RATE_LIMIT_WINDOW_SECONDS": WEBHOOK_RATE_LIMIT_WINDOW_SECONDS,
         "WEBHOOK_RATE_LIMIT_GLOBAL_MAX": WEBHOOK_RATE_LIMIT_GLOBAL_MAX,
         "WEBHOOK_RATE_LIMIT_REPO_MAX": WEBHOOK_RATE_LIMIT_REPO_MAX,
+        "WORKER_RUN_AS_UID": WORKER_RUN_AS_UID,
+        "WORKER_RUN_AS_GID": WORKER_RUN_AS_GID,
     }
     for name, value in positive_limits.items():
         if value <= 0:
@@ -233,6 +239,10 @@ def validate_runtime_configuration() -> None:
                 allowlisted_hosts=parse_host_patterns(LLM_HOST_ALLOWLIST_RAW),
                 no_proxy_hosts=parse_host_patterns(WORKER_NO_PROXY),
             )
+            if llm_decision.host == WORKER_HOST_GATEWAY_NAME and not WORKER_ENABLE_HOST_GATEWAY:
+                raise RuntimeError(
+                    "WORKER_ENABLE_HOST_GATEWAY must be true when LLM_API_URL targets host.docker.internal."
+                )
             if llm_decision.route == "proxy":
                 squid_domains = load_squid_allowed_domains(SQUID_CONFIG_PATH)
                 if not host_allowed_by_squid(llm_decision.host, squid_domains):
@@ -734,6 +744,47 @@ async def notify_slack(event_type: str, issue_number: int, title: str) -> None:
             print(f"Slack notification failed: {exc}")
 
 
+def _worker_container_user() -> str:
+    return f"{WORKER_RUN_AS_UID}:{WORKER_RUN_AS_GID}"
+
+
+def _worker_container_extra_hosts() -> Dict[str, str] | None:
+    if not WORKER_ENABLE_HOST_GATEWAY:
+        return None
+    return {WORKER_HOST_GATEWAY_NAME: "host-gateway"}
+
+
+def _prepare_worker_mount_permissions(client: DockerClient, mounts: List[Mount]) -> None:
+    init_container = None
+    try:
+        init_container = client.containers.run(
+            WORKER_IMAGE,
+            command=[
+                "sh",
+                "-lc",
+                (
+                    "mkdir -p /workspace /artifacts && "
+                    f"chown {WORKER_RUN_AS_UID}:{WORKER_RUN_AS_GID} /workspace /artifacts && "
+                    "chmod 700 /workspace && chmod 755 /artifacts"
+                ),
+            ],
+            mounts=mounts,
+            detach=True,
+            user="0:0",
+        )
+        result = init_container.wait(timeout=60)
+        status_code = int(result.get("StatusCode", 1)) if isinstance(result, dict) else 1
+        if status_code != 0:
+            logs = init_container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+            raise Exception(f"Worker mount preparation failed: {logs[-800:]}")
+    finally:
+        if init_container is not None:
+            try:
+                init_container.remove(force=True)
+            except Exception:
+                pass
+
+
 def _run_worker_container(task: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
     """
     Run a one-off worker container and return (session_payload, logs).
@@ -767,6 +818,7 @@ def _run_worker_container(task: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
             Mount(target="/workspace", source=workspace_volume_name, type="volume", read_only=False),
             Mount(target="/artifacts", source=WORKER_ARTIFACTS_VOLUME, type="volume", read_only=False),
         ]
+        _prepare_worker_mount_permissions(client, mounts)
         env = {
             "ISSUE_JSON": json.dumps(
                 {
@@ -791,6 +843,10 @@ def _run_worker_container(task: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
             "LLM_API_URL": LLM_API_URL,
             "LLM_MODEL": LLM_MODEL,
             "LLM_HOST_ALLOWLIST": LLM_HOST_ALLOWLIST_RAW,
+            "WORKER_HTTP_PROXY": WORKER_HTTP_PROXY,
+            "WORKER_HTTPS_PROXY": WORKER_HTTPS_PROXY,
+            "WORKER_NO_PROXY": WORKER_NO_PROXY,
+            "WORKER_ENABLE_HOST_GATEWAY": "true" if WORKER_ENABLE_HOST_GATEWAY else "false",
             "HTTP_PROXY": WORKER_HTTP_PROXY,
             "HTTPS_PROXY": WORKER_HTTPS_PROXY,
             "ALL_PROXY": WORKER_HTTPS_PROXY,
@@ -800,23 +856,28 @@ def _run_worker_container(task: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
             "all_proxy": WORKER_HTTPS_PROXY,
             "no_proxy": WORKER_NO_PROXY,
         }
+        run_kwargs: Dict[str, Any] = {
+            "command": ["python", "worker_entrypoint.py"],
+            "environment": env,
+            "mounts": mounts,
+            "network": WORKER_NETWORK,
+            "detach": True,
+            "user": _worker_container_user(),
+            "read_only": True,
+            "tmpfs": {"/tmp": "rw,noexec,nosuid,size=256m"},
+            "mem_limit": WORKER_MEMORY_LIMIT,
+            "nano_cpus": int(WORKER_CPU_LIMIT * 1_000_000_000),
+            "pids_limit": WORKER_PIDS_LIMIT,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges"],
+        }
+        extra_hosts = _worker_container_extra_hosts()
+        if extra_hosts:
+            run_kwargs["extra_hosts"] = extra_hosts
 
         container = client.containers.run(
             WORKER_IMAGE,
-            command=["python", "worker_entrypoint.py"],
-            environment=env,
-            mounts=mounts,
-            network=WORKER_NETWORK,
-            detach=True,
-            user="0:0",
-            extra_hosts={"host.docker.internal": "host-gateway"},
-            read_only=True,
-            tmpfs={"/tmp": "rw,noexec,nosuid,size=256m"},
-            mem_limit=WORKER_MEMORY_LIMIT,
-            nano_cpus=int(WORKER_CPU_LIMIT * 1_000_000_000),
-            pids_limit=WORKER_PIDS_LIMIT,
-            cap_drop=["ALL"],
-            security_opt=["no-new-privileges"],
+            **run_kwargs,
         )
         container.wait(timeout=WORKER_TIMEOUT_SECONDS)
         logs_text = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")

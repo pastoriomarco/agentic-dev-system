@@ -69,8 +69,13 @@ class AgentOrchestrator:
 
         self.llm_api_url = os.environ.get("LLM_API_URL", "http://localhost:8080/v1/chat/completions")
         self.llm_model = os.environ.get("LLM_MODEL", "qwen3-coder-next")
-        self.llm_host_allowlist = parse_host_patterns(os.environ.get("LLM_HOST_ALLOWLIST", "localhost,host.docker.internal"))
-        self.no_proxy_hosts = parse_host_patterns(os.environ.get("WORKER_NO_PROXY", "localhost,127.0.0.1,host.docker.internal"))
+        self.llm_host_allowlist = parse_host_patterns(os.environ.get("LLM_HOST_ALLOWLIST", "localhost"))
+        self.no_proxy_hosts = parse_host_patterns(
+            os.environ.get("WORKER_NO_PROXY")
+            or os.environ.get("NO_PROXY")
+            or os.environ.get("no_proxy")
+            or "localhost,127.0.0.1"
+        )
         self.base_branch = os.environ.get("GITHUB_BASE_BRANCH", "main")
 
         self.max_changed_files = int(os.environ.get("AGENT_MAX_CHANGED_FILES", "20"))

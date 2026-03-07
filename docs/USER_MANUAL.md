@@ -128,11 +128,15 @@ Backoff is exponential and capped by `RETRY_MAX_DELAY_SECONDS`.
 - `WORKER_CPU_LIMIT`
 - `WORKER_MEMORY_LIMIT`
 - `WORKER_PIDS_LIMIT`
+- `WORKER_RUN_AS_UID`
+- `WORKER_RUN_AS_GID`
+- `WORKER_ENABLE_HOST_GATEWAY`
 - `WORKER_ARTIFACTS_DIR`
 - `WORKER_ARTIFACTS_VOLUME`
 - `WORKER_VOLUME_PREFIX`
 
 Current execution model uses Docker socket access from webhook service. Treat host as privileged infrastructure.
+Worker containers now run as the configured non-root UID/GID by default; a short-lived root-owned prep container fixes volume permissions before the real worker starts.
 
 ### 4.6 Egress controls
 
@@ -148,7 +152,8 @@ Important behavior:
 - Public `LLM_API_URL` hosts must be in `LLM_HOST_ALLOWLIST`, must not appear in `WORKER_NO_PROXY`, and must be present in Squid `allowed_domains`.
 - Private or loopback `LLM_API_URL` hosts must be in `LLM_HOST_ALLOWLIST` and must appear in `WORKER_NO_PROXY`.
 - Metadata and link-local targets are blocked.
-- Compose maps `host.docker.internal` into the webhook container, and worker containers receive the same host-gateway alias for local-host LLM routes.
+- `host.docker.internal` access inside worker containers is opt-in via `WORKER_ENABLE_HOST_GATEWAY=true`.
+- Compose still maps `host.docker.internal` into the webhook container for operator-side local LLM/deep-health use.
 
 ### 4.7 Agent quality and policy controls
 
@@ -354,6 +359,7 @@ Check:
 - `WEBHOOK_RATE_LIMIT_*` is sized for expected webhook bursts.
 - `LLM_HOST_ALLOWLIST` contains the configured LLM hostname.
 - Public LLM hosts are not listed in `WORKER_NO_PROXY`; private/local LLM hosts are.
+- If `LLM_API_URL` uses `host.docker.internal`, `WORKER_ENABLE_HOST_GATEWAY=true` is set.
 - `ALLOWED_REPOS` and repository name formatting (`owner/repo`).
 - Event type/action is in supported matrix.
 - Duplicate delivery IDs are not being replayed.
@@ -396,6 +402,7 @@ Check:
 - Proxy egress to GitHub (`DEEP_HEALTH_GITHUB_URL`).
 - Optional LLM endpoint availability if enabled in deep health.
 - Squid `allowed_domains`, `LLM_HOST_ALLOWLIST`, and `WORKER_NO_PROXY` agree on whether the LLM route is proxied or direct.
+- `WORKER_ENABLE_HOST_GATEWAY` is enabled only when the worker must reach `host.docker.internal`.
 
 ## 11. Security Hardening Checklist
 
@@ -406,8 +413,9 @@ Use this as minimum baseline:
 3. Set `ADMIN_API_TOKEN` and restrict admin API network access.
 4. Set explicit `ALLOWED_REPOS`.
 5. Keep Squid allowlist minimal.
-6. Isolate host with Docker socket exposure.
-7. Monitor dead-letter queue and repeated failures.
+6. Keep `WORKER_ENABLE_HOST_GATEWAY=false` unless a host-local LLM route is explicitly required.
+7. Isolate host with Docker socket exposure.
+8. Monitor dead-letter queue and repeated failures.
 
 ## 12. Testing and Validation
 

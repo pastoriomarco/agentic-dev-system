@@ -27,15 +27,17 @@ This backlog is re-evaluated for:
   - `Rank 9 / P0` Recover orphaned `processing` tasks to `needs_human` on startup.
   - `Rank 10 / P0` Enforce strict LLM output schema + action/path policy validation before any file edit.
   - `Rank 11 / P0` Align egress controls (`proxy` allowlist + `NO_PROXY`) and add explicit `LLM_HOST_ALLOWLIST` config validation.
-  - `Rank 12 / P0` Add SSRF/internal network containment: block link-local, metadata, and RFC1918 destinations by default.
+  - `Rank 12 / P0` Add scoped outbound endpoint validation for LLM/deep-health URLs: block metadata/link-local targets and reject unintended private-network routing for configured service endpoints.
+  - `Rank 30 / P0` Make worker host-gateway exposure opt-in; inject `host.docker.internal` and direct-route bypass only for explicit local-host LLM mode.
+  - `Rank 13 / P0` Run worker containers as non-root by default after a short-lived root-owned mount-permission prep step.
 - Next up:
-  - `Rank 13 / P0` Run worker containers as non-root by default (keep existing read-only/caps-drop hardening).
-  - `Rank 8 / P0` Expand PR-aware execution beyond the V1 path: review comments, review bodies, richer comment location context, and fork-safe handling.
+  - `Recommended next session / P0` Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion.
   - `Rank 9 / P0` Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion.
+  - `Rank 8 / P0` Expand PR-aware execution beyond the V1 path: review comments, review bodies, richer comment location context, and fork-safe handling.
 
-## Prioritized Backlog (Highest to Lowest)
+## Backlog By Priority Level
 
-The table below keeps the original ranking for traceability. Items listed in `Completed` above are already delivered; the active backlog now starts with Rank 13 plus the remaining follow-on scope in Ranks 8 and 9.
+The table below is ordered by `Priority` first. Original rank references are preserved for traceability, but active work should be chosen from the highest-priority open items at the top of each priority band.
 
 | Rank | Priority | Improvement | Impact | Complexity | Why this priority |
 |---|---|---|---|---|---|
@@ -50,8 +52,9 @@ The table below keeps the original ranking for traceability. Items listed in `Co
 | 9 | P0 | Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion | Very High | Medium | Restart recovery now preserves task state, but worker/container cleanup and session/artifact reconciliation are still incomplete. |
 | 10 | P0 | Enforce strict LLM output schema + action/path policy validation before any file edit | Very High | Medium | Delivered. Malformed or policy-violating LLM edit payloads now halt in `needs_human` before any workspace mutation. |
 | 11 | P0 | Align egress controls (`proxy` allowlist + `NO_PROXY`) and add explicit `LLM_HOST_ALLOWLIST` config validation | High | Low | Delivered. Startup now validates whether the configured LLM host must route directly or through Squid and rejects drift between allowlist, proxy, and `NO_PROXY`. |
-| 12 | P0 | Add SSRF/internal network containment: block link-local, metadata, and RFC1918 destinations by default | High | Medium | Delivered. Worker LLM requests now reject metadata/link-local targets and unintended private-network routes before making outbound HTTP calls. |
-| 13 | P0 | Run worker containers as non-root by default (keep existing read-only/caps-drop hardening) | High | Low | High-value isolation improvement with minimal operational overhead. |
+| 12 | P0 | Add scoped outbound endpoint validation for configured LLM/deep-health URLs | High | Medium | Delivered. Startup and worker LLM calls now reject metadata/link-local targets and unintended private-network routing for configured service endpoints, but arbitrary subprocess egress is still a separate concern. |
+| 30 | P0 | Make worker host-gateway exposure opt-in; inject `host.docker.internal` and direct-route bypass only for explicit local-host LLM mode | High | Low-Medium | Delivered. Workers only receive the host-gateway alias when explicitly enabled for local-host LLM mode. |
+| 13 | P0 | Run worker containers as non-root by default (keep existing read-only/caps-drop hardening) | High | Low | Delivered. Worker launch now fixes mount permissions in a short-lived root prep step and runs the actual worker process as the configured non-root UID/GID. |
 | 14 | P1 | Use GitHub App installation tokens with minimal repo-scoped permissions; split read/write credentials | High | Medium | Reduces credential blast radius and aligns permissions with allowlisted repos. |
 | 15 | P1 | Add clone transport policy: enforce HTTPS clone URL by default; reject unsupported SSH/private URL modes unless explicitly configured | High | Low-Medium | Prevents clone/push failures and hidden auth mismatches, especially for private repos. |
 | 16 | P1 | Add LLM data-minimization controls: redact secrets/tokens/log fragments before prompt submission | High | Medium | Reduces exfiltration risk through the one allowed outbound channel (LLM endpoint). |
