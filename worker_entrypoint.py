@@ -27,7 +27,7 @@ def _fail_payload(message: str) -> dict:
 async def _run() -> dict:
     issue_raw = os.environ.get("ISSUE_JSON", "")
     output_path = os.environ.get("OUTPUT_PATH", "")
-    github_token = os.environ.get("GITHUB_TOKEN", "")
+    github_token = os.environ.get("GITHUB_WRITE_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")
     repo_url = os.environ.get("TARGET_REPO_URL", "")
 
     if not issue_raw:

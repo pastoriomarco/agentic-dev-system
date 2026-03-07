@@ -1,5 +1,5 @@
 """
-Agent Orchestrator - processes one issue and opens a PR.
+Agent Orchestrator - processes one issue or pull-request task and publishes changes.
 """
 
 import json
@@ -16,6 +16,10 @@ from urllib.parse import urlparse
 import httpx
 
 
+class NeedsHumanError(Exception):
+    """Raised when the task should halt and return to human review."""
+
+
 @dataclass
 class AgentSession:
     """Represents an agent session for processing an issue."""
@@ -26,12 +30,15 @@ class AgentSession:
     issue_title: str
     issue_body: str
     is_pr: bool
+    subject_kind: str = "issue"
+    task_id: str = ""
     status: str = "pending"
     created_at: str = ""
     started_at: str = ""
     completed_at: str = ""
     output_pr_number: Optional[int] = None
     output_pr_url: Optional[str] = None
+    changed_files: List[str] = None
     logs: List[str] = None
     errors: List[str] = None
     working_dir: str = ""
@@ -41,6 +48,8 @@ class AgentSession:
             self.logs = []
         if self.errors is None:
             self.errors = []
+        if self.changed_files is None:
+            self.changed_files = []
         if not self.created_at:
             self.created_at = datetime.utcnow().isoformat()
 
@@ -114,6 +123,14 @@ class AgentOrchestrator:
         session.logs.append(log_entry)
         print(log_entry)
 
+    def _subprocess_env(self, include_write_token: bool = False) -> Dict[str, str]:
+        env = os.environ.copy()
+        env.pop("GITHUB_TOKEN", None)
+        env.pop("GITHUB_WRITE_TOKEN", None)
+        if include_write_token and self.github_token:
+            env["GITHUB_WRITE_TOKEN"] = self.github_token
+        return env
+
     def _run(
         self,
         cmd: List[str] | str,
@@ -121,6 +138,7 @@ class AgentOrchestrator:
         timeout: int = 120,
         shell: bool = False,
         check: bool = False,
+        env: Optional[Dict[str, str]] = None,
     ) -> subprocess.CompletedProcess:
         result = subprocess.run(
             cmd,
@@ -129,6 +147,7 @@ class AgentOrchestrator:
             text=True,
             timeout=timeout,
             shell=shell,
+            env=env,
         )
         if check and result.returncode != 0:
             raise Exception(f"Command failed ({cmd}): {result.stderr or result.stdout}")
@@ -142,13 +161,20 @@ class AgentOrchestrator:
             issue_title=issue_data.get("title", ""),
             issue_body=issue_data.get("body", ""),
             is_pr=issue_data.get("is_pr", False),
+            subject_kind=issue_data.get("subject_kind", "issue"),
+            task_id=issue_data.get("task_id", ""),
         )
         try:
             session.status = "in_progress"
             session.started_at = datetime.utcnow().isoformat()
 
             self._log(session, f"Cloning repository: {self.repo_url}")
-            await self._clone_repository(session)
+            await self._clone_repository(session, issue_data)
+
+            if issue_data.get("subject_kind") == "pull_request":
+                pr_changed_files = self._get_pull_request_changed_files(Path(session.working_dir), issue_data)
+                issue_data.setdefault("pr", {})["changed_files"] = pr_changed_files
+                self._log(session, f"Pull request changed files in scope: {len(pr_changed_files)}")
 
             self._log(session, f"Planning changes for issue #{issue_data['issue_number']}")
             plan = await self._plan_changes(session, issue_data)
@@ -156,6 +182,7 @@ class AgentOrchestrator:
 
             self._log(session, "Applying repo-aware edits from LLM plan")
             changed_files = await self._implement_changes(session, plan, issue_data)
+            session.changed_files = changed_files
             self._log(session, f"Changed files: {len(changed_files)}")
 
             if not changed_files:
@@ -165,7 +192,7 @@ class AgentOrchestrator:
                 return session
 
             self._log(session, "Running policy checks")
-            self._enforce_change_policies(session, changed_files)
+            self._enforce_change_policies(session, changed_files, issue_data)
 
             self._log(session, "Running quality gates (lint/test)")
             await self._run_quality_gates(session)
@@ -178,27 +205,76 @@ class AgentOrchestrator:
                 self._log(session, "Nothing to commit after checks.")
                 return session
 
-            self._log(session, "Creating pull request")
-            pr_result = await self._create_pull_request(session, plan, issue_data)
+            publish_action = "Updating pull request" if issue_data.get("subject_kind") == "pull_request" else "Creating pull request"
+            self._log(session, publish_action)
+            pr_result = await self._publish_changes(session, plan, issue_data)
             session.status = "completed"
             session.completed_at = datetime.utcnow().isoformat()
             session.output_pr_number = pr_result.get("number")
             session.output_pr_url = pr_result.get("url")
+        except NeedsHumanError as exc:
+            session.status = "needs_human"
+            session.errors.append(str(exc))
+            self._log(session, f"Needs human review: {exc}")
         except Exception as exc:
             session.status = "failed"
             session.errors.append(str(exc))
             self._log(session, f"Error: {exc}")
         return session
 
-    async def _clone_repository(self, session: AgentSession) -> str:
+    def _sanitize_origin_url(self, work_dir: str) -> None:
+        self._run(["git", "remote", "set-url", "origin", self.repo_url], cwd=work_dir, check=True)
+
+    def _current_head_sha(self, work_dir: str) -> str:
+        result = self._run(["git", "rev-parse", "HEAD"], cwd=work_dir, check=True)
+        return result.stdout.strip()
+
+    async def _clone_repository(self, session: AgentSession, issue_data: Dict[str, Any]) -> str:
         work_dir = self.working_base / session.session_id
         work_dir.mkdir(parents=True, exist_ok=True)
         session.working_dir = str(work_dir)
         clone_url = self._authenticated_repo_url()
-        result = self._run(["git", "clone", "--depth", "1", clone_url, "."], cwd=str(work_dir), timeout=300)
-        if result.returncode != 0:
-            raise Exception(f"Git clone failed: {result.stderr}")
+        if issue_data.get("subject_kind") == "pull_request":
+            pr = issue_data.get("pr") or {}
+            if not pr.get("same_repo"):
+                raise NeedsHumanError("Pull request comes from a forked repository; same-repo PRs only are supported.")
+            head_ref = pr.get("head_ref", "")
+            head_sha = pr.get("head_sha", "")
+            base_ref = pr.get("base_ref", "")
+            if not head_ref or not head_sha or not base_ref:
+                raise NeedsHumanError("Pull request context is incomplete; missing head/base refs or SHA.")
+
+            result = self._run(["git", "clone", "--no-checkout", clone_url, "."], cwd=str(work_dir), timeout=300)
+            if result.returncode != 0:
+                raise Exception(f"Git clone failed: {result.stderr}")
+            self._run(["git", "fetch", "--depth", "1", "origin", head_ref], cwd=str(work_dir), timeout=120, check=True)
+            self._run(["git", "checkout", "-B", head_ref, "FETCH_HEAD"], cwd=str(work_dir), timeout=120, check=True)
+            self._run(["git", "fetch", "--depth", "1", "origin", base_ref], cwd=str(work_dir), timeout=120, check=True)
+            current_sha = self._current_head_sha(str(work_dir))
+            if current_sha != head_sha:
+                raise NeedsHumanError(
+                    f"Pull request head moved before execution start ({head_sha[:12]} -> {current_sha[:12]}). Re-approve on latest SHA."
+                )
+            self._sanitize_origin_url(str(work_dir))
+        else:
+            result = self._run(["git", "clone", "--depth", "1", "--branch", self.base_branch, clone_url, "."], cwd=str(work_dir), timeout=300)
+            if result.returncode != 0:
+                raise Exception(f"Git clone failed: {result.stderr}")
+            self._sanitize_origin_url(str(work_dir))
         return str(work_dir)
+
+    def _get_pull_request_changed_files(self, work_dir: Path, issue_data: Dict[str, Any]) -> List[str]:
+        pr = issue_data.get("pr") or {}
+        base_ref = pr.get("base_ref", "")
+        if not base_ref:
+            return []
+        result = self._run(
+            ["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"],
+            cwd=str(work_dir),
+            timeout=60,
+            check=True,
+        )
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     async def _list_repo_files(self, work_dir: Path) -> List[str]:
         result = self._run(["git", "ls-files"], cwd=str(work_dir), timeout=60)
@@ -207,7 +283,18 @@ class AgentOrchestrator:
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     def _extract_keywords(self, issue_data: Dict[str, Any]) -> List[str]:
-        text = f"{issue_data.get('title','')} {issue_data.get('body','')}".lower()
+        pr = issue_data.get("pr") or {}
+        comment = issue_data.get("comment") or {}
+        text = " ".join(
+            [
+                issue_data.get("title", ""),
+                issue_data.get("body", ""),
+                pr.get("title", ""),
+                pr.get("body", ""),
+                comment.get("body", ""),
+                " ".join(pr.get("changed_files", []) or []),
+            ]
+        ).lower()
         keywords = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{3,}", text)
         stop = {"this", "that", "with", "from", "have", "should", "issue", "please", "need", "into"}
         return [k for k in keywords if k not in stop][:25]
@@ -217,6 +304,11 @@ class AgentOrchestrator:
         return sum(3 if kw in path_l else 0 for kw in keywords)
 
     def _select_candidate_files(self, files: List[str], issue_data: Dict[str, Any]) -> List[str]:
+        pr_changed_files = (issue_data.get("pr") or {}).get("changed_files") or []
+        if issue_data.get("subject_kind") == "pull_request" and pr_changed_files:
+            in_scope = [path for path in pr_changed_files if path in set(files)]
+            if in_scope:
+                files = in_scope
         keywords = self._extract_keywords(issue_data)
         scored = sorted(files, key=lambda path: self._score_file(path, keywords), reverse=True)
         strong = [f for f in scored if self._score_file(f, keywords) > 0]
@@ -286,10 +378,24 @@ class AgentOrchestrator:
             "You are a senior software engineer. Return JSON only with keys: "
             "summary, rationale, risk_level. Keep summary under 200 chars."
         )
+        subject_header = f"Issue #{issue_data['issue_number']}"
+        context_block = ""
+        if issue_data.get("subject_kind") == "pull_request":
+            pr = issue_data.get("pr") or {}
+            comment = issue_data.get("comment") or {}
+            subject_header = f"Pull request #{pr.get('number', issue_data['issue_number'])}"
+            context_block = (
+                f"\nPull request title: {pr.get('title', issue_data.get('title', ''))}\n"
+                f"Pull request body:\n{pr.get('body', '')}\n\n"
+                f"Triggering comment:\n{comment.get('body', issue_data.get('body', ''))}\n\n"
+                f"PR head/base: {pr.get('head_ref', '')}@{pr.get('head_sha', '')[:12]} -> {pr.get('base_ref', '')}\n"
+                f"PR changed files:\n" + "\n".join((pr.get("changed_files") or [])[:40]) + "\n\n"
+            )
         user_prompt = (
-            f"Issue #{issue_data['issue_number']}\n"
+            f"{subject_header}\n"
             f"Title: {issue_data.get('title','')}\n"
             f"Body:\n{issue_data.get('body','')}\n\n"
+            f"{context_block}"
             f"Candidate files:\n" + "\n".join(candidates[:30]) + "\n\n"
             f"Snippets:\n{chr(10).join(snippets[:8])}"
         )
@@ -353,10 +459,22 @@ class AgentOrchestrator:
         snippets_blob = "\n\n".join(
             [f"## {path}\n{snippet}" for path, snippet in file_snippets.items() if snippet.strip()]
         )
+        pr_context = ""
+        if issue_data.get("subject_kind") == "pull_request":
+            pr = issue_data.get("pr") or {}
+            comment = issue_data.get("comment") or {}
+            pr_context = (
+                f"Pull request title: {pr.get('title', issue_data.get('title', ''))}\n"
+                f"Pull request body:\n{pr.get('body', '')}\n\n"
+                f"Triggering comment:\n{comment.get('body', issue_data.get('body', ''))}\n\n"
+                f"Only edit files already changed in this PR unless you cannot proceed safely.\n"
+                f"Changed files:\n" + "\n".join((pr.get("changed_files") or [])[:50]) + "\n\n"
+            )
         user_prompt = (
-            f"Issue #{issue_data['issue_number']}\n"
+            f"{'Pull request' if issue_data.get('subject_kind') == 'pull_request' else 'Issue'} #{issue_data['issue_number']}\n"
             f"Title: {issue_data.get('title','')}\n"
             f"Body:\n{issue_data.get('body','')}\n\n"
+            f"{pr_context}"
             f"Plan summary:\n{plan}\n\n"
             f"Candidate files:\n" + "\n".join(candidate_files[:40]) + "\n\n"
             f"File snippets:\n{snippets_blob}\n\n"
@@ -397,11 +515,20 @@ class AgentOrchestrator:
         diff = self._run(["git", "diff", "--unified=0"], cwd=work_dir, timeout=60, check=True)
         return len(diff.stdout.splitlines())
 
-    def _enforce_change_policies(self, session: AgentSession, changed_files: List[str]) -> None:
+    def _enforce_change_policies(self, session: AgentSession, changed_files: List[str], issue_data: Dict[str, Any]) -> None:
         if len(changed_files) > self.max_changed_files:
             raise Exception(f"Policy violation: changed files {len(changed_files)} > {self.max_changed_files}")
         for rel_path in changed_files:
             self._validate_rel_path(rel_path)
+        if issue_data.get("subject_kind") == "pull_request":
+            allowed_pr_files = set((issue_data.get("pr") or {}).get("changed_files") or [])
+            if not allowed_pr_files:
+                raise NeedsHumanError("Pull request changed-file context is unavailable; cannot enforce safe edit scope.")
+            out_of_scope = sorted(path for path in changed_files if path not in allowed_pr_files)
+            if out_of_scope:
+                raise NeedsHumanError(
+                    "Pull request task would modify files outside the reviewed diff: " + ", ".join(out_of_scope[:10])
+                )
         diff_lines = self._count_diff_lines(session.working_dir)
         if diff_lines > self.max_diff_lines:
             raise Exception(f"Policy violation: diff lines {diff_lines} > {self.max_diff_lines}")
@@ -424,35 +551,80 @@ class AgentOrchestrator:
             )
         for cmd in commands:
             self._log(session, f"Quality gate: {cmd}")
-            result = self._run(cmd, cwd=str(work_dir), shell=True, timeout=self.quality_timeout_seconds)
+            result = self._run(
+                cmd,
+                cwd=str(work_dir),
+                shell=True,
+                timeout=self.quality_timeout_seconds,
+                env=self._subprocess_env(include_write_token=False),
+            )
             if result.returncode != 0:
                 stderr = (result.stderr or "").strip()
                 stdout = (result.stdout or "").strip()
                 output_preview = (stderr or stdout)[-1200:]
                 raise Exception(f"Quality gate failed: {cmd}\n{output_preview}")
 
+    def _push_url(self) -> str:
+        return self._authenticated_repo_url()
+
+    def _ensure_pull_request_head_unchanged(self, work_dir: str, issue_data: Dict[str, Any]) -> None:
+        pr = issue_data.get("pr") or {}
+        head_ref = pr.get("head_ref", "")
+        expected_head_sha = pr.get("head_sha", "")
+        if not head_ref or not expected_head_sha:
+            raise NeedsHumanError("Pull request head context is incomplete; cannot validate branch freshness.")
+        fetch_result = self._run(
+            ["git", "fetch", "--depth", "1", self._push_url(), head_ref],
+            cwd=work_dir,
+            timeout=120,
+        )
+        if fetch_result.returncode != 0:
+            raise Exception(f"Failed to refresh pull request head: {fetch_result.stderr}")
+        remote_head = self._run(["git", "rev-parse", "FETCH_HEAD"], cwd=work_dir, check=True).stdout.strip()
+        if remote_head != expected_head_sha:
+            raise NeedsHumanError(
+                f"Pull request head changed from approved SHA {expected_head_sha[:12]} to {remote_head[:12]}."
+            )
+
     async def _create_commit(self, session: AgentSession, plan: str, issue_data: Dict[str, Any]) -> Dict[str, Any]:
         work_dir = session.working_dir
         self._run(["git", "config", "user.email", "agent@github.local"], cwd=work_dir, check=True)
         self._run(["git", "config", "user.name", "AI Agent"], cwd=work_dir, check=True)
-        branch_name = f"agent/{issue_data['issue_number']}"
-
-        checkout = self._run(["git", "checkout", "-b", branch_name], cwd=work_dir)
-        if checkout.returncode != 0:
-            raise Exception(f"Git checkout failed: {checkout.stderr}")
+        if issue_data.get("subject_kind") == "pull_request":
+            pr = issue_data.get("pr") or {}
+            branch_name = pr.get("head_ref", "")
+            if not branch_name:
+                raise NeedsHumanError("Pull request head branch is missing.")
+            checkout = self._run(["git", "checkout", branch_name], cwd=work_dir)
+            if checkout.returncode != 0:
+                raise Exception(f"Git checkout failed: {checkout.stderr}")
+        else:
+            branch_name = f"agent/{issue_data['issue_number']}"
+            checkout = self._run(["git", "checkout", "-b", branch_name], cwd=work_dir)
+            if checkout.returncode != 0:
+                raise Exception(f"Git checkout failed: {checkout.stderr}")
 
         add = self._run(["git", "add", "."], cwd=work_dir)
         if add.returncode != 0:
             raise Exception(f"Git add failed: {add.stderr}")
 
-        commit_msg = f"Agent fix: Issue #{issue_data['issue_number']}\n\n{plan[:500]}"
+        commit_prefix = "Agent update" if issue_data.get("subject_kind") == "pull_request" else "Agent fix"
+        commit_msg = f"{commit_prefix}: Issue #{issue_data['issue_number']}\n\n{plan[:500]}"
         result = self._run(["git", "commit", "-m", commit_msg], cwd=work_dir)
         if result.returncode != 0:
             if "nothing to commit" in (result.stderr + result.stdout):
                 return {"success": True, "created_commit": False, "message": "No changes needed"}
             raise Exception(f"Git commit failed: {result.stderr}")
 
-        push = self._run(["git", "push", "-u", "origin", branch_name], cwd=work_dir)
+        if issue_data.get("subject_kind") == "pull_request":
+            self._ensure_pull_request_head_unchanged(work_dir, issue_data)
+            push = self._run(["git", "push", self._push_url(), f"HEAD:{branch_name}"], cwd=work_dir, env=self._subprocess_env(include_write_token=True))
+        else:
+            push = self._run(
+                ["git", "push", self._push_url(), f"HEAD:refs/heads/{branch_name}"],
+                cwd=work_dir,
+                env=self._subprocess_env(include_write_token=True),
+            )
         if push.returncode != 0:
             raise Exception(f"Git push failed: {push.stderr}")
         return {"success": True, "created_commit": True, "branch": branch_name}
@@ -495,3 +667,34 @@ Generated by AI Developer Agent
                 raise Exception(f"Failed to create PR: {response.text}")
             pr_info = response.json()
             return {"number": pr_info.get("number"), "url": pr_info.get("html_url")}
+
+    async def _comment_on_pull_request(self, issue_data: Dict[str, Any], plan: str, changed_files: List[str]) -> Dict[str, Any]:
+        pr = issue_data.get("pr") or {}
+        pr_number = pr.get("number")
+        if not pr_number:
+            raise NeedsHumanError("Pull request number missing; cannot publish update.")
+        if not self.github_token:
+            raise Exception("GITHUB_TOKEN is required to publish pull request updates.")
+        owner, repo = self._owner_repo()
+        url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
+        headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        changed_blob = "\n".join(f"- `{path}`" for path in changed_files[:15]) or "- no tracked file changes"
+        body = (
+            f"AI agent updated this pull request branch.\n\n"
+            f"Task: `{issue_data.get('task_id', '')}`\n\n"
+            f"Summary:\n{plan}\n\n"
+            f"Changed files:\n{changed_blob}"
+        )
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=headers, json={"body": body})
+            if response.status_code not in (200, 201):
+                print(f"Warning: failed to comment on pull request #{pr_number}: {response.status_code} {response.text[:200]}")
+        return {"number": pr_number, "url": pr.get("html_url")}
+
+    async def _publish_changes(self, session: AgentSession, plan: str, issue_data: Dict[str, Any]) -> Dict[str, Any]:
+        if issue_data.get("subject_kind") == "pull_request":
+            return await self._comment_on_pull_request(issue_data, plan, session.changed_files)
+        return await self._create_pull_request(session, plan, issue_data)

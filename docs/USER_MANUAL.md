@@ -10,7 +10,7 @@ Use this together with:
 
 ## 1. System Overview
 
-The service receives GitHub webhooks, stores candidate work in Redis, and executes approved items in isolated worker containers.
+The service receives GitHub issue webhooks plus a narrow set of pull request events, stores candidate work in Redis, and executes approved items in isolated worker containers.
 
 Core components:
 
@@ -24,9 +24,9 @@ High-level flow:
 1. GitHub sends webhook to `/webhook/github`.
 2. Service verifies signature and basic ingress controls.
 3. Service stores queue item with status `queued`.
-4. Human approves via `/api/issues/{queue_key}/approve`.
+4. Human approves via `/api/issues/{queue_key}/approve` for issue tasks or `/api/tasks/{task_id}/approve` for PR tasks.
 5. Service starts worker container and tracks session.
-6. Item moves to `completed`, `queued_retry`, or `dead_letter`.
+6. Item moves to `completed`, `queued_retry`, `needs_human`, or `dead_letter`.
 
 ## 2. Prerequisites
 
@@ -55,7 +55,7 @@ Set required values in `.env`:
 - `GITHUB_WEBHOOK_SECRET`
 - `GITHUB_TOKEN`
 - `GITHUB_OWNER` and `GITHUB_REPO` (or explicit `ALLOWED_REPOS`)
-- `ADMIN_API_TOKEN` (strongly recommended)
+- `ADMIN_API_TOKEN` (required in production)
 
 Start stack:
 
@@ -81,6 +81,7 @@ curl http://localhost:8000/health/deep
 Important behavior:
 
 - If `DEPLOYMENT_ENV=production` and `GITHUB_WEBHOOK_SECRET` is empty, startup fails.
+- If `DEPLOYMENT_ENV=production` and `ADMIN_API_TOKEN` is empty, startup fails.
 - Supported webhook deliveries require `X-GitHub-Delivery`.
 - Duplicate delivery IDs inside TTL are ignored.
 
@@ -88,7 +89,7 @@ Important behavior:
 
 - `GITHUB_OWNER`, `GITHUB_REPO`: fallback single-repo allowlist if `ALLOWED_REPOS` is empty.
 - `ALLOWED_REPOS`: comma-separated `owner/repo` allowlist.
-- `GITHUB_TOKEN`: token used for GitHub API operations and clone/push.
+- `GITHUB_TOKEN`: token used for GitHub API operations and clone/push. The worker only exposes write credentials during publish/comment steps; quality gates run without write-token subprocess environment.
 
 Allowlist behavior:
 
@@ -100,7 +101,7 @@ Allowlist behavior:
 
 - `ADMIN_API_TOKEN`: protects approval/reject/requeue endpoints using `X-Admin-Token`.
 
-If unset, admin endpoints are open to any caller reaching the service.
+If unset, admin endpoints are open to any caller reaching the service in development. Production startup fails if it is empty.
 
 ### 4.4 Retry behavior
 
@@ -156,18 +157,22 @@ Repository settings:
 Subscribe to events:
 
 - `issues`
-- `pull_request`
 - `issue_comment`
-- `pull_request_review`
-- `pull_request_review_comment`
+- `pull_request`
 
 Supported actions:
 
 - `issues`: `opened`, `edited`, `reopened`
-- `pull_request`: `opened`, `edited`, `reopened`, `synchronize`
 - `issue_comment`: `created`
-- `pull_request_review`: `submitted`, `edited`
-- `pull_request_review_comment`: `created`
+- `pull_request`: `synchronize`
+
+Important limitations:
+
+- `issue_comment` on an issue thread is always eligible for queueing under the normal trigger rules.
+- `issue_comment` on a pull request creates a task only when the comment contains `@agent` or `@ai`.
+- Pull request tasks are supported only for same-repo PRs with complete head/base metadata.
+- `pull_request.synchronize` does not create a new task; it moves queued/approved/open PR tasks for the old head SHA to `needs_human`.
+- Pull request review events and review comments are still unsupported.
 
 Unsupported events/actions are accepted at HTTP level but ignored with status `202`.
 
@@ -189,12 +194,15 @@ curl http://localhost:8000/api/issues
 curl http://localhost:8000/api/issues/<queue_key>
 curl http://localhost:8000/api/dead-letter/issues
 curl http://localhost:8000/api/sessions
+curl http://localhost:8000/api/tasks
+curl http://localhost:8000/api/tasks/<task_id>
 ```
 
 Queue key format:
 
 - `owner:repo:issue_number`
 - Example: `pastoriomarco:agentic-dev-system:42`
+- GitHub issue and pull request numbers share one namespace, so the queue projection exposes `subject_kind` to distinguish them.
 
 ### 6.3 Manual approvals
 
@@ -224,6 +232,22 @@ curl -X POST \
 
 If `ADMIN_API_TOKEN` is not set, omit `X-Admin-Token`.
 
+Pull request task approvals must use the task-level endpoints:
+
+```bash
+curl -X POST \
+  -H "X-Admin-Token: <ADMIN_API_TOKEN>" \
+  http://localhost:8000/api/tasks/<task_id>/approve
+
+curl -X POST \
+  -H "X-Admin-Token: <ADMIN_API_TOKEN>" \
+  http://localhost:8000/api/tasks/<task_id>/reject
+
+curl -X POST \
+  -H "X-Admin-Token: <ADMIN_API_TOKEN>" \
+  http://localhost:8000/api/tasks/<task_id>/requeue
+```
+
 ## 7. State and Label Model
 
 Main queue statuses:
@@ -233,6 +257,7 @@ Main queue statuses:
 - `processing`
 - `completed`
 - `queued_retry`
+- `needs_human`
 - `dead_letter`
 - `rejected`
 
@@ -240,12 +265,19 @@ Default GitHub labels:
 
 - `agent:queued`
 - `agent:in-progress`
+- `agent:needs-human`
 - `agent:pr-opened`
 - `agent:failed`
 - `agent:dead-letter`
 - `agent:rejected`
 
 The service can also post issue comments for key state changes.
+
+For supported PR tasks, `needs_human` is also used when:
+
+- the service restarts while a PR task is `processing`,
+- the PR head SHA changes before publish,
+- the agent attempts to edit files outside the PR's current changed-file set.
 
 ## 8. Ingress Behavior and Responses
 
@@ -258,8 +290,11 @@ Common outcomes:
 - `202 ignored repo_not_allowlisted`
 - `202 ignored unsupported_event`
 - `202 ignored unsupported_action`
+- `202 ignored pull_request_comment_without_agent_trigger`
+- `202 ignored fork_pull_request_not_supported`
+- `202 ignored pull_request_context_incomplete`
 - `202 ignored duplicate_delivery`
-- `200 received`: accepted and queued for background processing.
+- `200 received`: accepted and queued for background processing, or a `pull_request.synchronize` stale-task reconciliation was applied.
 
 ## 9. Operations and Monitoring
 
@@ -267,9 +302,10 @@ Recommended routine:
 
 1. Check `/health/deep`.
 2. Review queue with `/api/issues`.
-3. Approve or reject pending items.
-4. Check `/api/sessions` for run outcomes.
-5. Check `/api/dead-letter/issues` and requeue if appropriate.
+3. Inspect `/api/tasks` when a queue projection represents a pull request task.
+4. Approve or reject pending items.
+5. Check `/api/sessions` for run outcomes.
+6. Check `/api/dead-letter/issues` and requeue if appropriate.
 
 If using compose logs:
 
@@ -291,6 +327,8 @@ Check:
 - `ALLOWED_REPOS` and repository name formatting (`owner/repo`).
 - Event type/action is in supported matrix.
 - Duplicate delivery IDs are not being replayed.
+- Pull request issue comments include `@agent` or `@ai`.
+- Pull request is same-repo and still has valid head/base metadata.
 
 ### 10.2 Approval API returns 401
 
@@ -309,7 +347,16 @@ Check:
 - Git credentials, repo permissions, and branch protections.
 - Quality command failures and timeout (`AGENT_QUALITY_*`).
 
-### 10.4 Deep health degraded
+### 10.4 Runs move to `needs_human`
+
+Check:
+
+- Whether the service restarted while a task was `processing`.
+- Whether an operator attempted an invalid state transition.
+- Whether a pull request head SHA moved or the worker blocked an out-of-scope edit.
+- Whether the task should be manually reapproved with `/requeue` or replaced by a newer event/task.
+
+### 10.5 Deep health degraded
 
 Check:
 
@@ -344,7 +391,10 @@ Validate webhook ingress controls manually:
 1. Send signed webhook with unique `X-GitHub-Delivery`.
 2. Replay same payload with same delivery ID and expect dedup ignore.
 3. Send unsupported action and confirm ignore.
-4. Remove signature and confirm rejection.
+4. Send a PR issue comment without `@agent` and confirm ignore.
+5. Send a same-repo PR issue comment with `@agent` and confirm a pull request task appears in `/api/tasks`.
+6. Send `pull_request.synchronize` for that PR and confirm open tasks move to `needs_human`.
+7. Remove signature and confirm rejection.
 
 ## 13. Documentation Conventions
 

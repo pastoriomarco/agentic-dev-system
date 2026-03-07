@@ -8,8 +8,11 @@ class FakeRedis:
         self.kv = {}
         self.zsets = {}
 
-    async def set(self, key, value):
+    async def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.kv:
+            return False
         self.kv[key] = value
+        return True
 
     async def get(self, key):
         return self.kv.get(key)
@@ -53,11 +56,13 @@ class RetryDeadLetterFlowTest(unittest.IsolatedAsyncioTestCase):
         self.orig_max_retries = wh.MAX_RETRIES
         self.orig_retry_base = wh.RETRY_BASE_DELAY_SECONDS
         self.orig_retry_max = wh.RETRY_MAX_DELAY_SECONDS
+        self.orig_github_token = wh.GITHUB_TOKEN
 
         wh.redis_client = FakeRedis()
         wh.MAX_RETRIES = 2
         wh.RETRY_BASE_DELAY_SECONDS = 1
         wh.RETRY_MAX_DELAY_SECONDS = 2
+        wh.GITHUB_TOKEN = ""
 
         self.run_count = 0
 
@@ -82,12 +87,18 @@ class RetryDeadLetterFlowTest(unittest.IsolatedAsyncioTestCase):
         wh.MAX_RETRIES = self.orig_max_retries
         wh.RETRY_BASE_DELAY_SECONDS = self.orig_retry_base
         wh.RETRY_MAX_DELAY_SECONDS = self.orig_retry_max
+        wh.GITHUB_TOKEN = self.orig_github_token
 
     async def test_failed_issue_moves_to_dead_letter_after_max_retries(self):
         queue_key = "pastoriomarco:agentic-dev-system:42"
-        issue = {
+        task = {
+            "task_id": "delivery-42",
             "queue_key": queue_key,
+            "subject_kind": "issue",
+            "trigger_source": "issues",
             "event_type": "issues",
+            "event_action": "opened",
+            "delivery_id": "delivery-42",
             "issue_number": 42,
             "title": "Test dead-letter transition",
             "body": "Force failures to test retry flow",
@@ -98,27 +109,44 @@ class RetryDeadLetterFlowTest(unittest.IsolatedAsyncioTestCase):
             "repo_full_name": "pastoriomarco/agentic-dev-system",
             "repo_clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git",
             "created_at": wh.now_utc().isoformat(),
+            "updated_at": wh.now_utc().isoformat(),
             "attempt_count": 0,
             "next_retry_at": None,
             "last_error": None,
+            "errors": [],
             "assigned_agent": None,
             "output_pr": None,
+            "approved_at": wh.now_utc().isoformat(),
+            "started_at": None,
+            "completed_at": None,
+            "retried_at": None,
+            "rejected_at": None,
+            "dead_lettered_at": None,
+            "needs_human_at": None,
+            "needs_human_reason": None,
+            "pr": None,
+            "comment": None,
         }
-        await wh.store_issue(issue)
+        await wh.store_task(task, create_only=False)
+        await wh.sync_issue_projection(queue_key)
 
-        # 1st run -> queued_retry, 2nd run -> queued_retry, 3rd run -> dead_letter
         for _ in range(wh.MAX_RETRIES + 1):
             await wh.run_agent_for_issue(queue_key)
-            current = await wh.load_issue(queue_key)
-            if current["status"] == "queued_retry":
-                current["status"] = "approved"
-                current.pop("next_retry_at", None)
-                await wh.store_issue(current)
+            issue, current_task = await wh.load_current_task_for_issue(queue_key)
+            if current_task["status"] == "queued_retry":
+                current_task, issue = await wh.transition_task(
+                    queue_key,
+                    current_task,
+                    "approved",
+                    retried_at=wh.now_utc().isoformat(),
+                    next_retry_at=None,
+                )
 
-        final_issue = await wh.load_issue(queue_key)
+        final_issue, final_task = await wh.load_current_task_for_issue(queue_key)
         self.assertEqual(final_issue["status"], "dead_letter")
-        self.assertEqual(final_issue["attempt_count"], wh.MAX_RETRIES + 1)
-        self.assertIn("forced failure", final_issue.get("last_error", ""))
+        self.assertEqual(final_task["status"], "dead_letter")
+        self.assertEqual(final_task["attempt_count"], wh.MAX_RETRIES + 1)
+        self.assertIn("forced failure", final_task.get("last_error", ""))
 
         sessions = await wh.list_sessions()
         self.assertEqual(len(sessions), wh.MAX_RETRIES + 1)

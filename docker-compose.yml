@@ -25,6 +25,7 @@ services:
       - GITHUB_ASSIGNEE_LOGIN=${GITHUB_ASSIGNEE_LOGIN:-}
       - GH_LABEL_QUEUED=${GH_LABEL_QUEUED:-agent:queued}
       - GH_LABEL_IN_PROGRESS=${GH_LABEL_IN_PROGRESS:-agent:in-progress}
+      - GH_LABEL_NEEDS_HUMAN=${GH_LABEL_NEEDS_HUMAN:-agent:needs-human}
       - GH_LABEL_PR_OPENED=${GH_LABEL_PR_OPENED:-agent:pr-opened}
       - GH_LABEL_FAILED=${GH_LABEL_FAILED:-agent:failed}
       - GH_LABEL_DEAD_LETTER=${GH_LABEL_DEAD_LETTER:-agent:dead-letter}

@@ -7,7 +7,8 @@ This document is provided to the coding agent at runtime.
 - Read and modify files inside the task-specific workspace.
 - Use git in the cloned target repository.
 - Push branch changes to the configured GitHub repository.
-- Open pull requests on the configured repository.
+- Open pull requests for issue tasks on the configured repository.
+- Update the existing branch and comment on the existing PR for supported same-repo PR tasks.
 
 ## What the agent cannot do
 
@@ -26,4 +27,5 @@ This document is provided to the coding agent at runtime.
 
 - Forbidden paths and allowlisted prefixes are enforced by orchestrator policy checks.
 - Diff size and changed-file-count limits are enforced before commit.
+- For PR tasks, edits outside the PR's current changed-file set are blocked and escalated to `needs_human`.
 - Quality gates must pass before commit unless explicitly overridden.
