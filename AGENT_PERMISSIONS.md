@@ -28,4 +28,5 @@ This document is provided to the coding agent at runtime.
 - Forbidden paths and allowlisted prefixes are enforced by orchestrator policy checks.
 - Diff size and changed-file-count limits are enforced before commit.
 - For PR tasks, edits outside the PR's current changed-file set are blocked and escalated to `needs_human`.
+- For review-comment PR tasks, edits outside the commented file are blocked and escalated to `needs_human`.
 - Quality gates must pass before commit unless explicitly overridden.

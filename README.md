@@ -63,13 +63,14 @@ In target repository settings:
 - Payload URL: `https://<public-host>/webhook/github`
 - Content type: `application/json`
 - Secret: same value as `GITHUB_WEBHOOK_SECRET`
-- Events: `issues`, `issue_comment`, `pull_request`
-- Supported actions: `issues.opened`, `issues.edited`, `issues.reopened`, `issue_comment.created`, `pull_request.synchronize`
+- Events: `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`
+- Supported actions: `issues.opened`, `issues.edited`, `issues.reopened`, `issue_comment.created`, `pull_request.synchronize`, `pull_request_review.submitted`, `pull_request_review_comment.created`
 - Oversize webhook bodies are rejected with `413 payload_too_large`; fixed-window ingress throttling returns `429 rate_limited`.
 - Public LLM hosts must be in `LLM_HOST_ALLOWLIST` and reachable through the Squid `allowed_domains` proxy path; private/local LLM hosts must also be present in `WORKER_NO_PROXY`.
 - If `LLM_API_URL` uses `host.docker.internal`, set `WORKER_ENABLE_HOST_GATEWAY=true`; worker host-gateway exposure is otherwise disabled by default.
-- Issue comments on pull requests create a task only when they are on a same-repo PR and contain an explicit `@agent` or `@ai` trigger.
-- PR review events and review comments are still ignored.
+- Same-repo PR issue comments create a task only when they contain an explicit `@agent` or `@ai` trigger.
+- Same-repo PR review comments and submitted review bodies also create tasks only with an explicit `@agent` or `@ai` trigger.
+- Review-comment tasks are additionally scoped to the commented file and persisted with file/line context.
 
 ## API usage
 
@@ -204,8 +205,9 @@ Queue key format:
 
 ## Current limitations
 
-- PR-aware execution is intentionally narrow: only same-repo PR issue comments with explicit `@agent` or `@ai` triggers are supported.
-- PR review events, review comments, and forked PRs are not supported yet.
+- PR-aware execution is still intentionally narrow: only same-repo PR issue comments, review comments, and submitted review bodies with explicit `@agent` or `@ai` triggers are supported.
+- Forked PRs are still not supported yet.
+- Review-comment tasks must stay within the commented file; broader multi-file refactors from a review comment should be routed through human review instead.
 - LLM-generated edits can still fail on complex repos or ambiguous requirements; add repository-specific prompts/rules to improve reliability.
 - Domain-level allowlisting cannot guarantee single-repo access by itself; enforce single-repo scope with GitHub App/fine-grained token permissions.
 

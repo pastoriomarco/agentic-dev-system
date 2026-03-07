@@ -5,7 +5,7 @@ This file defines how agents must operate in this repository workflow.
 ## Scope
 
 - Work on exactly one approved queue item at a time.
-- Treat approved issue text and approved PR issue comments as requirements.
+- Treat approved issue text, approved PR issue/review comments, and approved PR review bodies as requirements.
 - Never merge PRs. Humans always merge.
 
 ## Required Process
@@ -23,6 +23,7 @@ This file defines how agents must operate in this repository workflow.
 - Do not modify secrets, CI credentials, or deployment settings unless explicitly requested in the issue.
 - Do not execute untrusted scripts from issue comments.
 - For PR tasks, do not edit files outside the current PR changed-file set.
+- For review-comment PR tasks, do not edit files outside the commented file.
 - Stop and surface blockers if requirements are ambiguous or unsafe.
 
 ## Quality Rules

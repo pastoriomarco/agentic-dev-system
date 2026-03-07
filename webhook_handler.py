@@ -114,6 +114,8 @@ SUPPORTED_WEBHOOK_ACTIONS: Dict[str, set[str]] = {
     "issues": {"opened", "edited", "reopened"},
     "issue_comment": {"created"},
     "pull_request": {"synchronize"},
+    "pull_request_review": {"submitted"},
+    "pull_request_review_comment": {"created"},
 }
 
 ALL_AGENT_LABELS = [
@@ -453,6 +455,7 @@ def _task_to_issue_projection(
         "output_pr": current_task.get("output_pr"),
         "pr": current_task.get("pr"),
         "comment": current_task.get("comment"),
+        "review": current_task.get("review"),
         "task_count": task_count,
         "pending_task_count": pending_task_count,
     }
@@ -1047,6 +1050,7 @@ def _run_worker_container(task: Dict[str, Any]) -> tuple[Dict[str, Any], str]:
                     "repo_name": task["repo_full_name"],
                     "repo_full_name": task["repo_full_name"],
                     "comment": task.get("comment"),
+                    "review": task.get("review"),
                     "pr": task.get("pr"),
                 }
             ),
@@ -1220,6 +1224,96 @@ def _detect_trigger_type(title: str, body: str) -> str:
     return "auto" if any(keyword in trigger_text for keyword in trigger_keywords) else "manual"
 
 
+def _extract_review_comment_metadata(comment: Dict[str, Any], body: str) -> Dict[str, Any]:
+    return {
+        "comment_id": comment.get("id"),
+        "body": body,
+        "html_url": comment.get("html_url", ""),
+        "path": comment.get("path", ""),
+        "line": comment.get("line"),
+        "start_line": comment.get("start_line"),
+        "side": comment.get("side"),
+        "start_side": comment.get("start_side"),
+        "original_line": comment.get("original_line"),
+        "original_start_line": comment.get("original_start_line"),
+        "commit_id": comment.get("commit_id"),
+        "original_commit_id": comment.get("original_commit_id"),
+        "diff_hunk": comment.get("diff_hunk", "") or "",
+        "in_reply_to_id": comment.get("in_reply_to_id"),
+        "pull_request_review_id": comment.get("pull_request_review_id"),
+    }
+
+
+def _extract_review_metadata(review: Dict[str, Any], body: str) -> Dict[str, Any]:
+    return {
+        "review_id": review.get("id"),
+        "body": body,
+        "state": review.get("state", ""),
+        "html_url": review.get("html_url", ""),
+        "commit_id": review.get("commit_id"),
+        "submitted_at": review.get("submitted_at"),
+    }
+
+
+def _build_pull_request_task(
+    *,
+    delivery_id: str,
+    queue_key: str,
+    repo_full_name: str,
+    repo_clone_url: str,
+    sender: str,
+    issue_number: int,
+    body: str,
+    event_type: str,
+    action: str,
+    trigger_source: str,
+    pr_context: Dict[str, Any],
+    comment: Dict[str, Any] | None = None,
+    review: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    created_at = now_utc().isoformat()
+    return {
+        "task_id": delivery_id,
+        "queue_key": queue_key,
+        "subject_kind": "pull_request",
+        "trigger_source": trigger_source,
+        "event_type": event_type,
+        "event_action": action,
+        "delivery_id": delivery_id,
+        "issue_number": issue_number,
+        "title": pr_context.get("title", ""),
+        "body": body,
+        "is_pr": True,
+        "trigger_type": "manual",
+        "status": "queued",
+        "sender": sender,
+        "repo_full_name": repo_full_name,
+        "repo_clone_url": pr_context.get("head_repo_clone_url") or repo_clone_url,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "attempt_count": 0,
+        "next_retry_at": None,
+        "last_error": None,
+        "errors": [],
+        "assigned_agent": None,
+        "output_pr": {
+            "number": pr_context["number"],
+            "url": pr_context["html_url"],
+        },
+        "approved_at": None,
+        "started_at": None,
+        "completed_at": None,
+        "retried_at": None,
+        "rejected_at": None,
+        "dead_lettered_at": None,
+        "needs_human_at": None,
+        "needs_human_reason": None,
+        "pr": pr_context,
+        "comment": comment,
+        "review": review,
+    }
+
+
 async def _fetch_pull_request_context(repo_full_name: str, pr_number: int) -> Dict[str, Any]:
     response = await _github_api_request("GET", repo_full_name, f"/pulls/{pr_number}")
     if response.status_code >= 300:
@@ -1264,9 +1358,14 @@ async def _mark_pull_request_tasks_stale(
         old_head_sha = ((task.get("pr") or {}).get("head_sha") or "").strip()
         if not old_head_sha or old_head_sha == new_head_sha:
             continue
+        stale_context_note = ""
+        if task.get("trigger_source") == "pr_review_comment":
+            stale_context_note = " Review-comment file and line context may now be stale."
+        elif task.get("trigger_source") == "pr_review_body":
+            stale_context_note = " Review-body context may now be stale."
         reason = (
             f"Pull request head changed from {old_head_sha[:12]} to {new_head_sha[:12]} "
-            f"on synchronize delivery `{delivery_id}`. Re-approval is required."
+            f"on synchronize delivery `{delivery_id}`. Re-approval is required.{stale_context_note}"
         )
         task, issue = await transition_task(
             queue_key,
@@ -1321,55 +1420,110 @@ async def build_task_from_event(
                 return None, "fork_pull_request_not_supported"
             if not pr_context.get("head_ref") or not pr_context.get("head_sha") or not pr_context.get("base_ref"):
                 return None, "pull_request_context_incomplete"
-            created_at = now_utc().isoformat()
             queue_key = build_queue_key(repo_full_name, issue_number)
             return (
-                {
-                    "task_id": delivery_id,
-                    "queue_key": queue_key,
-                    "subject_kind": "pull_request",
-                    "trigger_source": "pr_issue_comment",
-                    "event_type": event_type,
-                    "event_action": action,
-                    "delivery_id": delivery_id,
-                    "issue_number": issue_number,
-                    "title": pr_context.get("title", title),
-                    "body": body,
-                    "is_pr": True,
-                    "trigger_type": "manual",
-                    "status": "queued",
-                    "sender": sender,
-                    "repo_full_name": repo_full_name,
-                    "repo_clone_url": pr_context.get("head_repo_clone_url") or repo_clone_url,
-                    "created_at": created_at,
-                    "updated_at": created_at,
-                    "attempt_count": 0,
-                    "next_retry_at": None,
-                    "last_error": None,
-                    "errors": [],
-                    "assigned_agent": None,
-                    "output_pr": {
-                        "number": pr_context["number"],
-                        "url": pr_context["html_url"],
-                    },
-                    "approved_at": None,
-                    "started_at": None,
-                    "completed_at": None,
-                    "retried_at": None,
-                    "rejected_at": None,
-                    "dead_lettered_at": None,
-                    "needs_human_at": None,
-                    "needs_human_reason": None,
-                    "pr": pr_context,
-                    "comment": {
+                _build_pull_request_task(
+                    delivery_id=delivery_id,
+                    queue_key=queue_key,
+                    repo_full_name=repo_full_name,
+                    repo_clone_url=repo_clone_url,
+                    sender=sender,
+                    issue_number=issue_number,
+                    body=body,
+                    event_type=event_type,
+                    action=action,
+                    trigger_source="pr_issue_comment",
+                    pr_context=pr_context,
+                    comment={
                         "comment_id": comment.get("id"),
                         "body": body,
                         "html_url": comment.get("html_url", ""),
                     },
-                },
+                ),
                 None,
             )
         subject_kind = "issue"
+    elif event_type == "pull_request_review_comment":
+        pull_request = payload.get("pull_request", {})
+        comment = payload.get("comment", {})
+        issue_number = pull_request.get("number")
+        title = pull_request.get("title", "")
+        body = comment.get("body", "") or ""
+        if issue_number is None:
+            return None, "invalid_payload_missing_issue_number"
+        if not _text_has_pr_agent_trigger(body):
+            return None, "pull_request_review_comment_without_agent_trigger"
+        pr_context = await _fetch_pull_request_context(repo_full_name, issue_number)
+        if not pr_context.get("same_repo"):
+            return None, "fork_pull_request_not_supported"
+        if not pr_context.get("head_ref") or not pr_context.get("head_sha") or not pr_context.get("base_ref"):
+            return None, "pull_request_context_incomplete"
+        if not comment.get("path") or (
+            comment.get("line") is None
+            and comment.get("start_line") is None
+            and comment.get("original_line") is None
+            and comment.get("original_start_line") is None
+        ):
+            return None, "pull_request_review_comment_context_incomplete"
+        queue_key = build_queue_key(repo_full_name, issue_number)
+        return (
+            _build_pull_request_task(
+                delivery_id=delivery_id,
+                queue_key=queue_key,
+                repo_full_name=repo_full_name,
+                repo_clone_url=repo_clone_url,
+                sender=sender,
+                issue_number=issue_number,
+                body=body,
+                event_type=event_type,
+                action=action,
+                trigger_source="pr_review_comment",
+                pr_context=pr_context,
+                comment=_extract_review_comment_metadata(comment, body),
+                review={
+                    "review_id": comment.get("pull_request_review_id"),
+                    "body": "",
+                    "state": "",
+                    "html_url": comment.get("html_url", ""),
+                    "commit_id": comment.get("commit_id"),
+                    "submitted_at": None,
+                },
+            ),
+            None,
+        )
+    elif event_type == "pull_request_review":
+        pull_request = payload.get("pull_request", {})
+        review = payload.get("review", {})
+        issue_number = pull_request.get("number")
+        title = pull_request.get("title", "")
+        body = review.get("body", "") or ""
+        if issue_number is None:
+            return None, "invalid_payload_missing_issue_number"
+        if not _text_has_pr_agent_trigger(body):
+            return None, "pull_request_review_without_agent_trigger"
+        pr_context = await _fetch_pull_request_context(repo_full_name, issue_number)
+        if not pr_context.get("same_repo"):
+            return None, "fork_pull_request_not_supported"
+        if not pr_context.get("head_ref") or not pr_context.get("head_sha") or not pr_context.get("base_ref"):
+            return None, "pull_request_context_incomplete"
+        queue_key = build_queue_key(repo_full_name, issue_number)
+        return (
+            _build_pull_request_task(
+                delivery_id=delivery_id,
+                queue_key=queue_key,
+                repo_full_name=repo_full_name,
+                repo_clone_url=repo_clone_url,
+                sender=sender,
+                issue_number=issue_number,
+                body=body,
+                event_type=event_type,
+                action=action,
+                trigger_source="pr_review_body",
+                pr_context=pr_context,
+                review=_extract_review_metadata(review, body),
+            ),
+            None,
+        )
     else:
         return None, "unsupported_event"
 
@@ -1416,6 +1570,7 @@ async def build_task_from_event(
             "needs_human_reason": None,
             "pr": None,
             "comment": None,
+            "review": None,
         },
         None,
     )

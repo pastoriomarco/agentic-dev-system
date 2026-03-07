@@ -24,7 +24,7 @@ This backlog is re-evaluated for:
   - `Rank 6 / P0` Split immutable task records from mutable issue state so approvals and retries operate on a specific task ID.
   - `Rank 7 / P0` Make the state machine explicit, validate legal transitions, and use `needs_human` as a safe halt state.
   - `Rank 8 / P0` Deliver the minimum valid PR-aware path: same-repo PR issue comments with explicit `@agent`/`@ai` trigger, PR head/base binding, task-level approvals, update-in-place on the PR branch, and stale-task handling on `pull_request.synchronize`.
-  - `Rank 9 / P0` Recover orphaned `processing` tasks to `needs_human` on startup.
+  - `Rank 31 / P0` Support same-repo review-driven PR tasks: accept `pull_request_review_comment.created` and `pull_request_review.submitted` with explicit `@agent`/`@ai`, persist review file-line/body context, and restrict review-comment edits to the commented file.
   - `Rank 10 / P0` Enforce strict LLM output schema + action/path policy validation before any file edit.
   - `Rank 11 / P0` Align egress controls (`proxy` allowlist + `NO_PROXY`) and add explicit `LLM_HOST_ALLOWLIST` config validation.
   - `Rank 12 / P0` Add scoped outbound endpoint validation for LLM/deep-health URLs: block metadata/link-local targets and reject unintended private-network routing for configured service endpoints.
@@ -32,8 +32,8 @@ This backlog is re-evaluated for:
   - `Rank 13 / P0` Run worker containers as non-root by default after a short-lived root-owned mount-permission prep step.
   - `Rank 9 / P0` Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion.
 - Next up:
-  - `Recommended next session / P0` Expand PR-aware execution beyond the V1 path: review comments, review bodies, richer comment location context, and fork-safe handling.
-  - `Rank 8 / P0` Expand PR-aware execution beyond the V1 path: review comments, review bodies, richer comment location context, and fork-safe handling.
+  - `Recommended next session / P0` Add fork-safe PR handling: do not push to contributor forks; create a helper branch/PR in the base repo and comment back on the source PR instead.
+  - `Rank 32 / P0` Add fork-safe PR handling for PR-aware tasks with helper-branch/helper-PR publish mode.
 
 ## Backlog By Priority Level
 
@@ -41,6 +41,7 @@ The table below is ordered by `Priority` first. Original rank references are pre
 
 | Rank | Priority | Improvement | Impact | Complexity | Why this priority |
 |---|---|---|---|---|---|
+| 32 | P0 | Add fork-safe PR handling for PR-aware tasks with helper-branch/helper-PR publish mode | Very High | Medium-High | The remaining PR-aware gap is safe handling for contributor forks without pushing directly to fork branches. |
 | 1 | P0 | Require webhook signature verification in production (fail closed if `GITHUB_WEBHOOK_SECRET` missing) | Very High | Low | Delivered. This closed the direct trigger-spoofing path from unsigned webhooks in production. |
 | 2 | P0 | Add webhook deduplication/idempotency with `X-GitHub-Delivery` and explicit supported `action` filters | Very High | Low | Delivered. Duplicate or irrelevant events no longer create repeated work. |
 | 3 | P0 | Make webhook acceptance durable before returning `200` (persist task first, then mark delivery claimed/accepted) | Very High | Low-Medium | Delivered. Accepted work now survives process crashes between receipt and queue persistence. |
@@ -48,7 +49,8 @@ The table below is ordered by `Priority` first. Original rank references are pre
 | 5 | P0 | Add ingress hardening: request size limits + rate limiting on `/webhook/github` | Very High | Low-Medium | Delivered. Webhook ingestion now enforces explicit body caps and Redis-backed fixed-window throttling before task creation. |
 | 6 | P0 | Split immutable task records from mutable issue state; key work by delivery/task ID, not only `owner:repo:issue_number` | Very High | Medium | Delivered. New events no longer overwrite the exact approved/dead-letter work item or erase task history. |
 | 7 | P0 | Make state machine explicit and documented; validate legal transitions and add `agent:needs-human` halt state | Very High | Low-Medium | Delivered. Invalid manual actions and repeated autonomous failures now have a controlled halt path. |
-| 8 | P0 | Expand PR-aware execution beyond the V1 path: review comments, review bodies, richer comment location context, and fork-safe handling | Very High | Medium-High | The core same-repo PR issue-comment path exists now, but review-driven automation and fork safety still need a complete design. |
+| 8 | P0 | Deliver the minimum valid PR-aware path: same-repo PR issue comments with explicit `@agent`/`@ai` trigger, PR head/base binding, task-level approvals, update-in-place on the PR branch, and stale-task handling on `pull_request.synchronize` | Very High | Medium-High | Delivered. Same-repo PR issue comments now run against the approved PR head with task-level approvals and stale-task invalidation on synchronize. |
+| 31 | P0 | Support same-repo review-driven PR tasks: `pull_request_review_comment.created`, `pull_request_review.submitted`, persisted review file-line/body context, and commented-file-only enforcement for review-comment tasks | Very High | Medium | Delivered. Review-driven same-repo PR work now has explicit event support, persisted file/line context, and a pre-mutation same-file guard for review comments. |
 | 9 | P0 | Extend startup reconciliation from task-state recovery to detached worker containers/artifacts and session re-ingestion | Very High | Medium | Delivered. Startup now re-ingests finished worker session artifacts when available and cleans up orphaned worker containers/volumes for tasks left in `processing`. |
 | 10 | P0 | Enforce strict LLM output schema + action/path policy validation before any file edit | Very High | Medium | Delivered. Malformed or policy-violating LLM edit payloads now halt in `needs_human` before any workspace mutation. |
 | 11 | P0 | Align egress controls (`proxy` allowlist + `NO_PROXY`) and add explicit `LLM_HOST_ALLOWLIST` config validation | High | Low | Delivered. Startup now validates whether the configured LLM host must route directly or through Squid and rejects drift between allowlist, proxy, and `NO_PROXY`. |

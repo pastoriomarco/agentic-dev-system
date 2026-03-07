@@ -187,20 +187,27 @@ Subscribe to events:
 - `issues`
 - `issue_comment`
 - `pull_request`
+- `pull_request_review`
+- `pull_request_review_comment`
 
 Supported actions:
 
 - `issues`: `opened`, `edited`, `reopened`
 - `issue_comment`: `created`
 - `pull_request`: `synchronize`
+- `pull_request_review`: `submitted`
+- `pull_request_review_comment`: `created`
 
 Important limitations:
 
 - `issue_comment` on an issue thread is always eligible for queueing under the normal trigger rules.
 - `issue_comment` on a pull request creates a task only when the comment contains `@agent` or `@ai`.
+- `pull_request_review_comment` creates a task only when the review comment contains `@agent` or `@ai` and includes file/line context.
+- `pull_request_review` with action `submitted` creates a task only when the review body contains `@agent` or `@ai`.
 - Pull request tasks are supported only for same-repo PRs with complete head/base metadata.
+- Review-comment tasks are restricted to the commented file even if the model proposes a broader edit.
 - `pull_request.synchronize` does not create a new task; it moves queued/approved/open PR tasks for the old head SHA to `needs_human`.
-- Pull request review events and review comments are still unsupported.
+- Forked pull requests are still unsupported.
 
 Unsupported events/actions are accepted at HTTP level but ignored with status `202`.
 Ingress limits apply before task creation, so `413` and `429` responses do not enqueue or deduplicate work items.
@@ -322,6 +329,9 @@ Common outcomes:
 - `202 ignored unsupported_event`
 - `202 ignored unsupported_action`
 - `202 ignored pull_request_comment_without_agent_trigger`
+- `202 ignored pull_request_review_comment_without_agent_trigger`
+- `202 ignored pull_request_review_without_agent_trigger`
+- `202 ignored pull_request_review_comment_context_incomplete`
 - `202 ignored fork_pull_request_not_supported`
 - `202 ignored pull_request_context_incomplete`
 - `202 ignored duplicate_delivery`
@@ -435,8 +445,10 @@ Validate webhook ingress controls manually:
 5. Send unsupported action and confirm ignore.
 6. Send a PR issue comment without `@agent` and confirm ignore.
 7. Send a same-repo PR issue comment with `@agent` and confirm a pull request task appears in `/api/tasks`.
-8. Send `pull_request.synchronize` for that PR and confirm open tasks move to `needs_human`.
-9. Remove signature and confirm rejection.
+8. Send a same-repo PR review comment with `@agent` and confirm the task contains `comment.path` and line metadata.
+9. Send a submitted PR review body with `@agent` and confirm a pull request task appears in `/api/tasks`.
+10. Send `pull_request.synchronize` for that PR and confirm open tasks move to `needs_human`.
+11. Remove signature and confirm rejection.
 
 ## 13. Documentation Conventions
 

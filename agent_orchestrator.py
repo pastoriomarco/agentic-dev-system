@@ -294,6 +294,7 @@ class AgentOrchestrator:
     def _extract_keywords(self, issue_data: Dict[str, Any]) -> List[str]:
         pr = issue_data.get("pr") or {}
         comment = issue_data.get("comment") or {}
+        review = issue_data.get("review") or {}
         text = " ".join(
             [
                 issue_data.get("title", ""),
@@ -301,6 +302,10 @@ class AgentOrchestrator:
                 pr.get("title", ""),
                 pr.get("body", ""),
                 comment.get("body", ""),
+                comment.get("path", ""),
+                comment.get("diff_hunk", ""),
+                review.get("body", ""),
+                review.get("state", ""),
                 " ".join(pr.get("changed_files", []) or []),
             ]
         ).lower()
@@ -308,11 +313,37 @@ class AgentOrchestrator:
         stop = {"this", "that", "with", "from", "have", "should", "issue", "please", "need", "into"}
         return [k for k in keywords if k not in stop][:25]
 
+    def _review_comment_target_path(self, issue_data: Dict[str, Any]) -> Optional[str]:
+        if issue_data.get("trigger_source") != "pr_review_comment":
+            return None
+        comment = issue_data.get("comment") or {}
+        path = comment.get("path")
+        if not isinstance(path, str) or not path.strip():
+            raise NeedsHumanError("Pull request review comment is missing a target file path.")
+        try:
+            return self._validate_rel_path(path)
+        except Exception as exc:
+            raise NeedsHumanError(f"Pull request review comment path is not allowed: {exc}") from exc
+
+    def _review_comment_target_line(self, issue_data: Dict[str, Any]) -> Optional[int]:
+        if issue_data.get("trigger_source") != "pr_review_comment":
+            return None
+        comment = issue_data.get("comment") or {}
+        for key in ("line", "start_line", "original_line", "original_start_line"):
+            value = comment.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+        raise NeedsHumanError("Pull request review comment is missing usable line context.")
+
     def _score_file(self, file_path: str, keywords: List[str]) -> int:
         path_l = file_path.lower()
         return sum(3 if kw in path_l else 0 for kw in keywords)
 
     def _select_candidate_files(self, files: List[str], issue_data: Dict[str, Any]) -> List[str]:
+        review_path = self._review_comment_target_path(issue_data)
+        if review_path:
+            if review_path in set(files):
+                return [review_path]
         pr_changed_files = (issue_data.get("pr") or {}).get("changed_files") or []
         if issue_data.get("subject_kind") == "pull_request" and pr_changed_files:
             in_scope = [path for path in pr_changed_files if path in set(files)]
@@ -335,6 +366,78 @@ class AgentOrchestrator:
             return ""
         lines = content.splitlines()
         return "\n".join(lines[:max_lines])
+
+    def _read_line_window_snippet(
+        self,
+        work_dir: Path,
+        rel_path: str,
+        center_line: int,
+        radius: int = 20,
+    ) -> str:
+        path = work_dir / rel_path
+        if not path.exists() or not path.is_file():
+            return ""
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            return ""
+        if not lines:
+            return ""
+        clamped_line = max(1, min(center_line, len(lines)))
+        start = max(1, clamped_line - radius)
+        end = min(len(lines), clamped_line + radius)
+        numbered_lines = []
+        for line_number in range(start, end + 1):
+            marker = ">>" if line_number == clamped_line else "  "
+            numbered_lines.append(f"{marker} {line_number:04d}: {lines[line_number - 1]}")
+        return "\n".join(numbered_lines)
+
+    def _build_pull_request_context_block(self, work_dir: Path, issue_data: Dict[str, Any]) -> str:
+        pr = issue_data.get("pr") or {}
+        comment = issue_data.get("comment") or {}
+        review = issue_data.get("review") or {}
+        trigger_source = issue_data.get("trigger_source", "")
+        parts = [
+            f"Pull request title: {pr.get('title', issue_data.get('title', ''))}",
+            f"Pull request body:\n{pr.get('body', '')}",
+            f"Trigger source: {trigger_source}",
+            f"PR head/base: {pr.get('head_ref', '')}@{pr.get('head_sha', '')[:12]} -> {pr.get('base_ref', '')}",
+            "PR changed files:\n" + "\n".join((pr.get("changed_files") or [])[:50]),
+        ]
+
+        if comment.get("body"):
+            parts.append(f"Triggering comment:\n{comment.get('body', issue_data.get('body', ''))}")
+        if review.get("body"):
+            parts.append(
+                f"Triggering review ({review.get('state', 'submitted')}):\n{review.get('body', issue_data.get('body', ''))}"
+            )
+
+        review_path = self._review_comment_target_path(issue_data)
+        if review_path:
+            changed_files = set(pr.get("changed_files") or [])
+            if changed_files and review_path not in changed_files:
+                raise NeedsHumanError(
+                    f"Review-comment target file '{review_path}' is outside the current pull request diff."
+                )
+            review_line = self._review_comment_target_line(issue_data)
+            focused_snippet = self._read_line_window_snippet(work_dir, review_path, review_line, radius=20)
+            if not focused_snippet:
+                raise NeedsHumanError(
+                    f"Review-comment target file '{review_path}' is not available on the approved pull request head."
+                )
+            parts.append(
+                "\n".join(
+                    [
+                        f"Review comment file: {review_path}",
+                        f"Review comment line: {review_line}",
+                        f"Review comment side: {comment.get('side', '') or 'unknown'}",
+                        f"Review diff hunk:\n{comment.get('diff_hunk', '')}",
+                        f"Focused file context:\n{focused_snippet}",
+                        f"Only edit the reviewed file: {review_path}",
+                    ]
+                )
+            )
+        return "\n\n".join(part for part in parts if part.strip()) + "\n\n"
 
     async def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
         try:
@@ -495,15 +598,8 @@ class AgentOrchestrator:
         context_block = ""
         if issue_data.get("subject_kind") == "pull_request":
             pr = issue_data.get("pr") or {}
-            comment = issue_data.get("comment") or {}
             subject_header = f"Pull request #{pr.get('number', issue_data['issue_number'])}"
-            context_block = (
-                f"\nPull request title: {pr.get('title', issue_data.get('title', ''))}\n"
-                f"Pull request body:\n{pr.get('body', '')}\n\n"
-                f"Triggering comment:\n{comment.get('body', issue_data.get('body', ''))}\n\n"
-                f"PR head/base: {pr.get('head_ref', '')}@{pr.get('head_sha', '')[:12]} -> {pr.get('base_ref', '')}\n"
-                f"PR changed files:\n" + "\n".join((pr.get("changed_files") or [])[:40]) + "\n\n"
-            )
+            context_block = "\n" + self._build_pull_request_context_block(work_dir, issue_data)
         user_prompt = (
             f"{subject_header}\n"
             f"Title: {issue_data.get('title','')}\n"
@@ -558,6 +654,7 @@ class AgentOrchestrator:
 
     async def _request_edits_from_llm(
         self,
+        work_dir: Path,
         issue_data: Dict[str, Any],
         plan: str,
         candidate_files: List[str],
@@ -574,15 +671,7 @@ class AgentOrchestrator:
         )
         pr_context = ""
         if issue_data.get("subject_kind") == "pull_request":
-            pr = issue_data.get("pr") or {}
-            comment = issue_data.get("comment") or {}
-            pr_context = (
-                f"Pull request title: {pr.get('title', issue_data.get('title', ''))}\n"
-                f"Pull request body:\n{pr.get('body', '')}\n\n"
-                f"Triggering comment:\n{comment.get('body', issue_data.get('body', ''))}\n\n"
-                f"Only edit files already changed in this PR unless you cannot proceed safely.\n"
-                f"Changed files:\n" + "\n".join((pr.get("changed_files") or [])[:50]) + "\n\n"
-            )
+            pr_context = self._build_pull_request_context_block(work_dir, issue_data)
         user_prompt = (
             f"{'Pull request' if issue_data.get('subject_kind') == 'pull_request' else 'Issue'} #{issue_data['issue_number']}\n"
             f"Title: {issue_data.get('title','')}\n"
@@ -597,14 +686,38 @@ class AgentOrchestrator:
         payload = self._extract_json_object(response_text, "LLM edit response")
         return self._validate_edit_response(payload)
 
+    def _validate_requested_edit_scope(self, issue_data: Dict[str, Any], edits: List[Dict[str, Any]]) -> None:
+        if issue_data.get("subject_kind") != "pull_request":
+            return
+
+        pr_files = set((issue_data.get("pr") or {}).get("changed_files") or [])
+        if not pr_files:
+            raise NeedsHumanError("Pull request changed-file context is unavailable; cannot validate requested edit scope.")
+
+        edit_paths = {edit["path"] for edit in edits}
+        out_of_scope = sorted(path for path in edit_paths if path not in pr_files)
+        if out_of_scope:
+            raise NeedsHumanError(
+                "Pull request task requested edits outside the reviewed diff: " + ", ".join(out_of_scope[:10])
+            )
+
+        review_path = self._review_comment_target_path(issue_data)
+        if review_path:
+            disallowed = sorted(path for path in edit_paths if path != review_path)
+            if disallowed:
+                raise NeedsHumanError(
+                    "Review-comment task must stay within the commented file: " + ", ".join(disallowed[:10])
+                )
+
     async def _implement_changes(self, session: AgentSession, plan: str, issue_data: Dict[str, Any]) -> List[str]:
         work_dir = Path(session.working_dir)
         files = await self._list_repo_files(work_dir)
         candidates = self._select_candidate_files(files, issue_data)
         file_snippets = {path: self._read_file_snippet(work_dir, path, max_lines=120) for path in candidates[:12]}
 
-        llm_edits = await self._request_edits_from_llm(issue_data, plan, candidates, file_snippets)
+        llm_edits = await self._request_edits_from_llm(work_dir, issue_data, plan, candidates, file_snippets)
         edits = llm_edits["edits"]
+        self._validate_requested_edit_scope(issue_data, edits)
 
         touched = []
         for edit in edits:
@@ -639,6 +752,13 @@ class AgentOrchestrator:
                 raise NeedsHumanError(
                     "Pull request task would modify files outside the reviewed diff: " + ", ".join(out_of_scope[:10])
                 )
+            review_path = self._review_comment_target_path(issue_data)
+            if review_path:
+                wrong_files = sorted(path for path in changed_files if path != review_path)
+                if wrong_files:
+                    raise NeedsHumanError(
+                        "Review-comment task would modify files outside the commented file: " + ", ".join(wrong_files[:10])
+                    )
         diff_lines = self._count_diff_lines(session.working_dir)
         if diff_lines > self.max_diff_lines:
             raise Exception(f"Policy violation: diff lines {diff_lines} > {self.max_diff_lines}")
