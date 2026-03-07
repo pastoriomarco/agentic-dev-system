@@ -27,6 +27,10 @@ from redis.asyncio import Redis
 WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 RUNTIME_ENV = os.environ.get("DEPLOYMENT_ENV", "development").strip().lower()
 WEBHOOK_DELIVERY_TTL_SECONDS = int(os.environ.get("WEBHOOK_DELIVERY_TTL_SECONDS", "86400"))
+WEBHOOK_MAX_BODY_BYTES = int(os.environ.get("WEBHOOK_MAX_BODY_BYTES", "262144"))
+WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("WEBHOOK_RATE_LIMIT_WINDOW_SECONDS", "60"))
+WEBHOOK_RATE_LIMIT_GLOBAL_MAX = int(os.environ.get("WEBHOOK_RATE_LIMIT_GLOBAL_MAX", "120"))
+WEBHOOK_RATE_LIMIT_REPO_MAX = int(os.environ.get("WEBHOOK_RATE_LIMIT_REPO_MAX", "60"))
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN", "")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -83,6 +87,8 @@ RETRY_INDEX_KEY = "issues:retry:index"
 DEAD_LETTER_INDEX_KEY = "issues:dead_letter:index"
 ISSUE_TASKS_INDEX_PREFIX = "issue:tasks:"
 TASK_RETRY_INDEX_KEY = "tasks:retry:index"
+WEBHOOK_RATE_LIMIT_GLOBAL_KEY_PREFIX = "webhook:rate:global:"
+WEBHOOK_RATE_LIMIT_REPO_KEY_PREFIX = "webhook:rate:repo:"
 
 SUPPORTED_WEBHOOK_ACTIONS: Dict[str, set[str]] = {
     "issues": {"opened", "edited", "reopened"},
@@ -129,6 +135,18 @@ PROJECTION_STATUS_PRIORITY = {
     "queued": 4,
 }
 PR_AGENT_TRIGGER_KEYWORDS = ["@agent", "@ai"]
+
+
+class PayloadTooLargeError(Exception):
+    """Raised when a webhook body exceeds the configured byte limit."""
+
+
+class RateLimitExceededError(Exception):
+    """Raised when a webhook request exceeds configured fixed-window limits."""
+
+    def __init__(self, retry_after_seconds: int):
+        super().__init__("Webhook rate limit exceeded.")
+        self.retry_after_seconds = retry_after_seconds
 
 
 def now_utc() -> datetime:
@@ -183,6 +201,15 @@ def validate_runtime_configuration() -> None:
         raise RuntimeError("GITHUB_WEBHOOK_SECRET is required when DEPLOYMENT_ENV is set to production.")
     if is_production_runtime() and not ADMIN_API_TOKEN:
         raise RuntimeError("ADMIN_API_TOKEN is required when DEPLOYMENT_ENV is set to production.")
+    positive_limits = {
+        "WEBHOOK_MAX_BODY_BYTES": WEBHOOK_MAX_BODY_BYTES,
+        "WEBHOOK_RATE_LIMIT_WINDOW_SECONDS": WEBHOOK_RATE_LIMIT_WINDOW_SECONDS,
+        "WEBHOOK_RATE_LIMIT_GLOBAL_MAX": WEBHOOK_RATE_LIMIT_GLOBAL_MAX,
+        "WEBHOOK_RATE_LIMIT_REPO_MAX": WEBHOOK_RATE_LIMIT_REPO_MAX,
+    }
+    for name, value in positive_limits.items():
+        if value <= 0:
+            raise RuntimeError(f"{name} must be greater than zero.")
 
 
 async def get_redis() -> Redis:
@@ -478,16 +505,86 @@ async def list_sessions() -> List[Dict[str, Any]]:
     return [json.loads(v) for v in values if v]
 
 
-async def verify_github_signature(request: Request, signature: str) -> bool:
+def _parse_content_length(raw_value: str | None) -> int | None:
+    if raw_value is None:
+        return None
+    try:
+        parsed = int(raw_value.strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+async def read_webhook_body(request: Request) -> bytes:
+    content_length = _parse_content_length(request.headers.get("Content-Length"))
+    if content_length is not None and content_length > WEBHOOK_MAX_BODY_BYTES:
+        raise PayloadTooLargeError()
+
+    if hasattr(request, "stream"):
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > WEBHOOK_MAX_BODY_BYTES:
+                raise PayloadTooLargeError()
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    payload = await request.body()
+    if len(payload) > WEBHOOK_MAX_BODY_BYTES:
+        raise PayloadTooLargeError()
+    return payload
+
+
+def verify_github_signature(payload: bytes, signature: str) -> bool:
     """Verify GitHub webhook signature using HMAC SHA-256."""
     if not WEBHOOK_SECRET:
         return not is_production_runtime()
     if not signature:
         return False
-    payload = await request.body()
     digest = hmac.new(WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
     expected = f"sha256={digest}"
     return hmac.compare_digest(signature, expected)
+
+
+def _rate_limit_bucket(now: datetime | None = None) -> tuple[str, int]:
+    current = now or now_utc()
+    current_ts = int(current.timestamp())
+    window_start = current_ts - (current_ts % WEBHOOK_RATE_LIMIT_WINDOW_SECONDS)
+    retry_after = max(1, WEBHOOK_RATE_LIMIT_WINDOW_SECONDS - (current_ts - window_start))
+    return str(window_start), retry_after
+
+
+def _normalize_repo_token(repo_full_name: str) -> str:
+    return repo_full_name.strip().lower().replace("/", ":")
+
+
+async def _increment_rate_limit_counter(key: str, limit: int, retry_after_seconds: int) -> None:
+    if limit <= 0:
+        return
+    redis = await get_redis()
+    count = await redis.incr(key)
+    if count == 1:
+        await redis.expire(key, WEBHOOK_RATE_LIMIT_WINDOW_SECONDS + 1)
+    if count > limit:
+        raise RateLimitExceededError(retry_after_seconds)
+
+
+async def enforce_webhook_rate_limit(repo_full_name: str) -> int:
+    bucket, retry_after_seconds = _rate_limit_bucket()
+    await _increment_rate_limit_counter(
+        f"{WEBHOOK_RATE_LIMIT_GLOBAL_KEY_PREFIX}{bucket}",
+        WEBHOOK_RATE_LIMIT_GLOBAL_MAX,
+        retry_after_seconds,
+    )
+    normalized_repo = _normalize_repo_token(repo_full_name)
+    if normalized_repo:
+        await _increment_rate_limit_counter(
+            f"{WEBHOOK_RATE_LIMIT_REPO_KEY_PREFIX}{normalized_repo}:{bucket}",
+            WEBHOOK_RATE_LIMIT_REPO_MAX,
+            retry_after_seconds,
+        )
+    return retry_after_seconds
 
 
 def _split_owner_repo(repo_full_name: str) -> tuple[str, str]:
@@ -1257,12 +1354,30 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     signature = request.headers.get("X-Hub-Signature-256", "")
     delivery_id = request.headers.get("X-GitHub-Delivery", "").strip()
 
-    if not await verify_github_signature(request, signature):
+    try:
+        raw_payload = await read_webhook_body(request)
+    except PayloadTooLargeError:
+        return JSONResponse({"status": "ignored", "reason": "payload_too_large"}, status_code=413)
+
+    if not verify_github_signature(raw_payload, signature):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
-    payload = await request.json()
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON payload: top-level object required")
     action = payload.get("action", "")
     repo_full_name = payload.get("repository", {}).get("full_name", "").strip()
+    try:
+        await enforce_webhook_rate_limit(repo_full_name)
+    except RateLimitExceededError as exc:
+        return JSONResponse(
+            {"status": "ignored", "reason": "rate_limited"},
+            status_code=429,
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
     if repo_full_name and not is_repo_allowed(repo_full_name):
         print(f"Ignoring webhook from non-allowlisted repo: {repo_full_name}")
         return JSONResponse(

@@ -36,6 +36,7 @@ Edit `.env` with real values:
 - `GITHUB_WEBHOOK_SECRET`
 - `DEPLOYMENT_ENV` (`production` enforces non-empty `GITHUB_WEBHOOK_SECRET`)
 - `WEBHOOK_DELIVERY_TTL_SECONDS` (Redis dedup retention for `X-GitHub-Delivery`)
+- `WEBHOOK_MAX_BODY_BYTES`, `WEBHOOK_RATE_LIMIT_*` for webhook ingress limits
 - `GITHUB_TOKEN`
 - `GITHUB_OWNER`
 - `GITHUB_REPO`
@@ -45,7 +46,7 @@ Edit `.env` with real values:
 - `ALLOWED_REPOS` (recommended for multi-repo safety)
 - `MAX_RETRIES`, `RETRY_BASE_DELAY_SECONDS`, `RETRY_MAX_DELAY_SECONDS`, `RETRY_POLL_INTERVAL_SECONDS`
 - `WORKER_*` limits (CPU/memory/pids/timeout/image/network)
-- `AGENT_*` controls for changed-file policy, diff policy, and quality gates
+- `AGENT_*` controls for changed-file policy, diff policy, quality gates, and `AGENT_MAX_EDIT_ACTIONS`
 - `AGENT_PERMISSIONS_FILE` for explicit runtime permission context
 
 Start:
@@ -63,6 +64,7 @@ In target repository settings:
 - Secret: same value as `GITHUB_WEBHOOK_SECRET`
 - Events: `issues`, `issue_comment`, `pull_request`
 - Supported actions: `issues.opened`, `issues.edited`, `issues.reopened`, `issue_comment.created`, `pull_request.synchronize`
+- Oversize webhook bodies are rejected with `413 payload_too_large`; fixed-window ingress throttling returns `429 rate_limited`.
 - Issue comments on pull requests create a task only when they are on a same-repo PR and contain an explicit `@agent` or `@ai` trigger.
 - PR review events and review comments are still ignored.
 
@@ -161,6 +163,7 @@ Queue key format:
 - In `production`, startup fails if `GITHUB_WEBHOOK_SECRET` is empty; unsigned webhooks are rejected.
 - In `production`, startup also fails if `ADMIN_API_TOKEN` is empty.
 - Webhook delivery IDs (`X-GitHub-Delivery`) are deduplicated in Redis to prevent replay/duplicate processing.
+- `/webhook/github` enforces a request body cap and Redis-backed fixed-window rate limits before task creation.
 - Failed runs are retried with exponential backoff and moved to dead-letter after max retries.
 - Tasks left in `processing` across a service restart are moved to `needs_human` for manual review.
 - Supported PR tasks are bound to the PR head SHA; `pull_request.synchronize` or any head movement before publish moves the task to `needs_human`.
@@ -168,6 +171,7 @@ Queue key format:
 : read-only root filesystem, dropped Linux caps, no-new-privileges, CPU/memory/pids limits, dedicated per-task workspace volume.
 - Worker containers are destroyed after execution; workspace volume is removed; artifacts/logs are retained.
 - The orchestrator now performs repo-aware edits through LLM-generated file operations.
+- LLM plan/edit responses are schema-validated; malformed or policy-violating edit payloads halt in `needs_human` before any file mutation.
 - Commit is blocked unless quality gates pass and policy checks pass (changed file count, diff size, forbidden paths).
 - For PR tasks, quality-gate subprocesses run without GitHub write credentials and edits are constrained to the PR's changed files.
 - Agent permissions are explicitly provided from `AGENT_PERMISSIONS.md` and injected into LLM system prompts.

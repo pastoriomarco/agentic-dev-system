@@ -20,6 +20,7 @@ class FakeRedis:
     def __init__(self):
         self.kv = {}
         self.zsets = {}
+        self.expiry = {}
 
     async def set(self, key, value, ex=None, nx=False):
         if nx and key in self.kv:
@@ -55,6 +56,15 @@ class FakeRedis:
         matches.sort(key=lambda item: item[1])
         return [member for member, _ in matches]
 
+    async def incr(self, key):
+        value = int(self.kv.get(key, "0")) + 1
+        self.kv[key] = str(value)
+        return value
+
+    async def expire(self, key, seconds):
+        self.expiry[key] = seconds
+        return True
+
     async def ping(self):
         return True
 
@@ -70,12 +80,20 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         self.orig_redis_client = wh.redis_client
         self.orig_github_token = wh.GITHUB_TOKEN
         self.orig_fetch_pr_context = wh._fetch_pull_request_context
+        self.orig_webhook_max_body_bytes = wh.WEBHOOK_MAX_BODY_BYTES
+        self.orig_rate_limit_window_seconds = wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS
+        self.orig_rate_limit_global_max = wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX
+        self.orig_rate_limit_repo_max = wh.WEBHOOK_RATE_LIMIT_REPO_MAX
 
         wh.redis_client = FakeRedis()
         wh.WEBHOOK_SECRET = "test-secret"
         wh.RUNTIME_ENV = "production"
         wh.ADMIN_API_TOKEN = "admin-token"
         wh.GITHUB_TOKEN = ""
+        wh.WEBHOOK_MAX_BODY_BYTES = 262144
+        wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = 60
+        wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX = 120
+        wh.WEBHOOK_RATE_LIMIT_REPO_MAX = 60
 
     async def asyncTearDown(self):
         wh.RUNTIME_ENV = self.orig_runtime_env
@@ -84,6 +102,10 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         wh.redis_client = self.orig_redis_client
         wh.GITHUB_TOKEN = self.orig_github_token
         wh._fetch_pull_request_context = self.orig_fetch_pr_context
+        wh.WEBHOOK_MAX_BODY_BYTES = self.orig_webhook_max_body_bytes
+        wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = self.orig_rate_limit_window_seconds
+        wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX = self.orig_rate_limit_global_max
+        wh.WEBHOOK_RATE_LIMIT_REPO_MAX = self.orig_rate_limit_repo_max
 
     def _signed_headers(self, payload: bytes, delivery_id: str, event: str = "issues") -> dict:
         digest = hmac.new(wh.WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
@@ -111,7 +133,7 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
     async def test_signature_verification_fails_closed_without_secret_in_production(self):
         wh.RUNTIME_ENV = "production"
         wh.WEBHOOK_SECRET = ""
-        is_valid = await wh.verify_github_signature(FakeRequest(b"{}"), signature="")
+        is_valid = wh.verify_github_signature(b"{}", signature="")
         self.assertFalse(is_valid)
 
     async def test_signature_verification_validates_hmac(self):
@@ -121,8 +143,44 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         digest = hmac.new(wh.WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
         signature = f"sha256={digest}"
 
-        self.assertTrue(await wh.verify_github_signature(FakeRequest(payload), signature))
-        self.assertFalse(await wh.verify_github_signature(FakeRequest(payload), "sha256=bad"))
+        self.assertTrue(wh.verify_github_signature(payload, signature))
+        self.assertFalse(wh.verify_github_signature(payload, "sha256=bad"))
+
+    async def test_payload_too_large_is_rejected_from_content_length(self):
+        wh.WEBHOOK_MAX_BODY_BYTES = 32
+        payload = b'{"action":"opened"}'
+        headers = self._signed_headers(payload, "delivery-large-header")
+
+        async with httpx.AsyncClient(app=wh.app, base_url="http://test") as client:
+            request = client.build_request("POST", "/webhook/github", content=payload, headers=headers)
+            request.headers["Content-Length"] = str(wh.WEBHOOK_MAX_BODY_BYTES + 1)
+            response = await client.send(request)
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["reason"], "payload_too_large")
+        self.assertIsNone(await wh.load_task("delivery-large-header"))
+        self.assertIsNone(await wh.load_issue("pastoriomarco:agentic-dev-system:1"))
+
+    async def test_payload_too_large_is_rejected_from_actual_body_size(self):
+        wh.WEBHOOK_MAX_BODY_BYTES = 96
+        payload_obj = {
+            "action": "opened",
+            "repository": {"full_name": "pastoriomarco/agentic-dev-system", "clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git"},
+            "sender": {"login": "tester"},
+            "issue": {"number": 1, "title": "Too big", "body": "x" * 512},
+        }
+        payload = json.dumps(payload_obj).encode("utf-8")
+        headers = self._signed_headers(payload, "delivery-large-body")
+
+        async with httpx.AsyncClient(app=wh.app, base_url="http://test") as client:
+            request = client.build_request("POST", "/webhook/github", content=payload, headers=headers)
+            request.headers["Content-Length"] = "32"
+            response = await client.send(request)
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["reason"], "payload_too_large")
+        self.assertIsNone(await wh.load_task("delivery-large-body"))
+        self.assertIsNone(await wh.load_issue("pastoriomarco:agentic-dev-system:1"))
 
     async def test_webhook_persists_task_before_response_and_deduplicates_delivery(self):
         payload_obj = {
@@ -152,6 +210,80 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
 
             stored_issue = await wh.load_issue("pastoriomarco:agentic-dev-system:7")
             self.assertEqual(stored_issue["task_count"], 1)
+
+    async def test_global_rate_limit_rejects_before_task_creation(self):
+        wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX = 1
+        wh.WEBHOOK_RATE_LIMIT_REPO_MAX = 10
+
+        first_payload = json.dumps(
+            {
+                "action": "opened",
+                "repository": {"full_name": "pastoriomarco/agentic-dev-system", "clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git"},
+                "sender": {"login": "tester"},
+                "issue": {"number": 21, "title": "First", "body": "one"},
+            }
+        ).encode("utf-8")
+        second_payload = json.dumps(
+            {
+                "action": "opened",
+                "repository": {"full_name": "pastoriomarco/agentic-dev-system", "clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git"},
+                "sender": {"login": "tester"},
+                "issue": {"number": 22, "title": "Second", "body": "two"},
+            }
+        ).encode("utf-8")
+        first_headers = self._signed_headers(first_payload, "delivery-global-1")
+        second_headers = self._signed_headers(second_payload, "delivery-global-2")
+
+        async with httpx.AsyncClient(app=wh.app, base_url="http://test") as client:
+            first = await client.post("/webhook/github", content=first_payload, headers=first_headers)
+            second = await client.post("/webhook/github", content=second_payload, headers=second_headers)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(second.json()["reason"], "rate_limited")
+        retry_after = int(second.headers["Retry-After"])
+        self.assertGreaterEqual(retry_after, 1)
+        self.assertLessEqual(retry_after, wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS)
+        self.assertIsNotNone(await wh.load_task("delivery-global-1"))
+        self.assertIsNone(await wh.load_task("delivery-global-2"))
+        self.assertIsNone(await wh.load_issue("pastoriomarco:agentic-dev-system:22"))
+
+    async def test_repo_rate_limit_rejects_before_task_creation(self):
+        wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX = 10
+        wh.WEBHOOK_RATE_LIMIT_REPO_MAX = 1
+
+        first_payload = json.dumps(
+            {
+                "action": "opened",
+                "repository": {"full_name": "pastoriomarco/agentic-dev-system", "clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git"},
+                "sender": {"login": "tester"},
+                "issue": {"number": 31, "title": "First", "body": "one"},
+            }
+        ).encode("utf-8")
+        second_payload = json.dumps(
+            {
+                "action": "opened",
+                "repository": {"full_name": "pastoriomarco/agentic-dev-system", "clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git"},
+                "sender": {"login": "tester"},
+                "issue": {"number": 32, "title": "Second", "body": "two"},
+            }
+        ).encode("utf-8")
+        first_headers = self._signed_headers(first_payload, "delivery-repo-1")
+        second_headers = self._signed_headers(second_payload, "delivery-repo-2")
+
+        async with httpx.AsyncClient(app=wh.app, base_url="http://test") as client:
+            first = await client.post("/webhook/github", content=first_payload, headers=first_headers)
+            second = await client.post("/webhook/github", content=second_payload, headers=second_headers)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(second.json()["reason"], "rate_limited")
+        retry_after = int(second.headers["Retry-After"])
+        self.assertGreaterEqual(retry_after, 1)
+        self.assertLessEqual(retry_after, wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS)
+        self.assertIsNotNone(await wh.load_task("delivery-repo-1"))
+        self.assertIsNone(await wh.load_task("delivery-repo-2"))
+        self.assertIsNone(await wh.load_issue("pastoriomarco:agentic-dev-system:32"))
 
     async def test_pull_request_issue_comment_without_trigger_is_ignored(self):
         payload_obj = {

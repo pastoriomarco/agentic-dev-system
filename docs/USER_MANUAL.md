@@ -77,6 +77,10 @@ curl http://localhost:8000/health/deep
 - `GITHUB_WEBHOOK_SECRET`: GitHub HMAC secret.
 - `DEPLOYMENT_ENV`: runtime mode, `development` or `production`.
 - `WEBHOOK_DELIVERY_TTL_SECONDS`: dedup retention for `X-GitHub-Delivery` (default `86400`).
+- `WEBHOOK_MAX_BODY_BYTES`: hard cap for accepted webhook bodies (default `262144`).
+- `WEBHOOK_RATE_LIMIT_WINDOW_SECONDS`: fixed-window length for `/webhook/github` throttling (default `60`).
+- `WEBHOOK_RATE_LIMIT_GLOBAL_MAX`: max accepted webhook requests per window across all repos (default `120`).
+- `WEBHOOK_RATE_LIMIT_REPO_MAX`: max accepted webhook requests per window per repo (default `60`).
 
 Important behavior:
 
@@ -84,6 +88,8 @@ Important behavior:
 - If `DEPLOYMENT_ENV=production` and `ADMIN_API_TOKEN` is empty, startup fails.
 - Supported webhook deliveries require `X-GitHub-Delivery`.
 - Duplicate delivery IDs inside TTL are ignored.
+- Oversize webhook bodies return `413 payload_too_large`.
+- Fixed-window ingress throttling returns `429 rate_limited` with `Retry-After`.
 
 ### 4.2 Repo scoping and access
 
@@ -139,12 +145,19 @@ Default Squid config allows GitHub domains only.
 
 - `AGENT_MAX_CHANGED_FILES`
 - `AGENT_MAX_DIFF_LINES`
+- `AGENT_MAX_EDIT_ACTIONS`
 - `AGENT_ALLOWED_PATH_PREFIXES`
 - `AGENT_FORBIDDEN_PATH_PREFIXES`
 - `AGENT_QUALITY_COMMANDS`
 - `AGENT_QUALITY_TIMEOUT_SECONDS`
 - `AGENT_ALLOW_NO_QUALITY_GATES`
 - `AGENT_PERMISSIONS_FILE`
+
+Important behavior:
+
+- LLM plan responses must include a non-empty `summary`.
+- LLM edit responses may contain only `summary` and `edits`.
+- Invalid or policy-violating LLM output is escalated to `needs_human` before any file edit is applied.
 
 ## 5. GitHub Webhook Setup
 
@@ -175,6 +188,7 @@ Important limitations:
 - Pull request review events and review comments are still unsupported.
 
 Unsupported events/actions are accepted at HTTP level but ignored with status `202`.
+Ingress limits apply before task creation, so `413` and `429` responses do not enqueue or deduplicate work items.
 
 ## 6. API Runbook
 
@@ -286,6 +300,8 @@ Webhook endpoint: `POST /webhook/github`
 Common outcomes:
 
 - `401 Invalid signature`: missing/invalid `X-Hub-Signature-256`.
+- `413 payload_too_large`: request exceeds `WEBHOOK_MAX_BODY_BYTES`.
+- `429 rate_limited`: request exceeded global or per-repo fixed-window ingress limits.
 - `400 Missing X-GitHub-Delivery header`: required for supported events/actions.
 - `202 ignored repo_not_allowlisted`
 - `202 ignored unsupported_event`
@@ -324,6 +340,8 @@ Check:
 - GitHub webhook delivery log status code and response body.
 - `GITHUB_WEBHOOK_SECRET` matches GitHub secret.
 - `DEPLOYMENT_ENV=production` is not combined with empty secret.
+- `WEBHOOK_MAX_BODY_BYTES` is large enough for expected GitHub payload sizes.
+- `WEBHOOK_RATE_LIMIT_*` is sized for expected webhook bursts.
 - `ALLOWED_REPOS` and repository name formatting (`owner/repo`).
 - Event type/action is in supported matrix.
 - Duplicate delivery IDs are not being replayed.
@@ -346,6 +364,7 @@ Check:
 - Worker image availability and startup.
 - Git credentials, repo permissions, and branch protections.
 - Quality command failures and timeout (`AGENT_QUALITY_*`).
+- Whether malformed LLM JSON or unsupported edit fields moved the task to `needs_human` instead of retrying.
 
 ### 10.4 Runs move to `needs_human`
 
@@ -390,11 +409,13 @@ Validate webhook ingress controls manually:
 
 1. Send signed webhook with unique `X-GitHub-Delivery`.
 2. Replay same payload with same delivery ID and expect dedup ignore.
-3. Send unsupported action and confirm ignore.
-4. Send a PR issue comment without `@agent` and confirm ignore.
-5. Send a same-repo PR issue comment with `@agent` and confirm a pull request task appears in `/api/tasks`.
-6. Send `pull_request.synchronize` for that PR and confirm open tasks move to `needs_human`.
-7. Remove signature and confirm rejection.
+3. Send an oversize payload and confirm `413 payload_too_large`.
+4. Burst requests above the configured limit and confirm `429 rate_limited`.
+5. Send unsupported action and confirm ignore.
+6. Send a PR issue comment without `@agent` and confirm ignore.
+7. Send a same-repo PR issue comment with `@agent` and confirm a pull request task appears in `/api/tasks`.
+8. Send `pull_request.synchronize` for that PR and confirm open tasks move to `needs_human`.
+9. Remove signature and confirm rejection.
 
 ## 13. Documentation Conventions
 

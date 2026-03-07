@@ -72,6 +72,7 @@ class AgentOrchestrator:
 
         self.max_changed_files = int(os.environ.get("AGENT_MAX_CHANGED_FILES", "20"))
         self.max_diff_lines = int(os.environ.get("AGENT_MAX_DIFF_LINES", "1500"))
+        self.max_edit_actions = int(os.environ.get("AGENT_MAX_EDIT_ACTIONS", "50"))
         self.quality_timeout_seconds = int(os.environ.get("AGENT_QUALITY_TIMEOUT_SECONDS", "600"))
         self.allow_no_quality_gates = os.environ.get("AGENT_ALLOW_NO_QUALITY_GATES", "false").lower() == "true"
         self.agent_permissions_file = os.environ.get("AGENT_PERMISSIONS_FILE", "/app/AGENT_PERMISSIONS.md")
@@ -352,7 +353,7 @@ class AgentOrchestrator:
         except Exception as exc:
             raise Exception(f"Unexpected LLM response shape: {exc}")
 
-    def _extract_json_object(self, text: str) -> Dict[str, Any]:
+    def _extract_json_object(self, text: str, response_name: str) -> Dict[str, Any]:
         text = text.strip()
         # Support fenced JSON responses.
         if "```" in text:
@@ -362,8 +363,104 @@ class AgentOrchestrator:
         start = text.find("{")
         end = text.rfind("}")
         if start == -1 or end == -1 or end <= start:
-            raise Exception("No JSON object found in LLM output.")
-        return json.loads(text[start : end + 1])
+            raise NeedsHumanError(f"{response_name} did not contain a JSON object.")
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise NeedsHumanError(f"{response_name} was not valid JSON: {exc.msg}.") from exc
+        if not isinstance(parsed, dict):
+            raise NeedsHumanError(f"{response_name} must be a JSON object.")
+        return parsed
+
+    def _validate_plan_response(self, payload: Dict[str, Any]) -> Dict[str, str]:
+        summary = payload.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise NeedsHumanError("LLM plan response must include a non-empty summary.")
+
+        validated: Dict[str, str] = {"summary": summary.strip()}
+        for field_name in ("rationale", "risk_level"):
+            value = payload.get(field_name)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise NeedsHumanError(f"LLM plan response field '{field_name}' must be a string.")
+            cleaned = value.strip()
+            if cleaned:
+                validated[field_name] = cleaned
+        return validated
+
+    def _validate_edit_spec(self, edit: Dict[str, Any], index: int) -> Dict[str, str]:
+        if not isinstance(edit, dict):
+            raise NeedsHumanError(f"LLM edit #{index} must be an object.")
+
+        action = edit.get("action")
+        if not isinstance(action, str) or not action.strip():
+            raise NeedsHumanError(f"LLM edit #{index} must include a non-empty string action.")
+
+        normalized_action = action.strip().lower()
+        if normalized_action not in {"overwrite", "append", "replace"}:
+            raise NeedsHumanError(f"LLM edit #{index} uses unsupported action '{action}'.")
+
+        allowed_fields = {
+            "overwrite": {"path", "action", "content"},
+            "append": {"path", "action", "content"},
+            "replace": {"path", "action", "find", "replace"},
+        }[normalized_action]
+        unknown_fields = sorted(set(edit.keys()) - allowed_fields)
+        if unknown_fields:
+            raise NeedsHumanError(
+                f"LLM edit #{index} includes unsupported fields: {', '.join(unknown_fields)}."
+            )
+
+        path = edit.get("path")
+        if not isinstance(path, str) or not path.strip():
+            raise NeedsHumanError(f"LLM edit #{index} must include a non-empty string path.")
+        try:
+            normalized_path = self._validate_rel_path(path)
+        except Exception as exc:
+            raise NeedsHumanError(f"LLM edit #{index} has an invalid path: {exc}") from exc
+
+        validated = {"path": normalized_path, "action": normalized_action}
+        if normalized_action in {"overwrite", "append"}:
+            content = edit.get("content")
+            if not isinstance(content, str):
+                raise NeedsHumanError(
+                    f"LLM edit #{index} action '{normalized_action}' requires a string content field."
+                )
+            validated["content"] = content
+            return validated
+
+        find = edit.get("find")
+        replace = edit.get("replace")
+        if not isinstance(find, str) or not find:
+            raise NeedsHumanError("LLM replace edit must include a non-empty string find field.")
+        if not isinstance(replace, str):
+            raise NeedsHumanError("LLM replace edit must include a string replace field.")
+        validated["find"] = find
+        validated["replace"] = replace
+        return validated
+
+    def _validate_edit_response(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        unknown_top_level = sorted(set(payload.keys()) - {"summary", "edits"})
+        if unknown_top_level:
+            raise NeedsHumanError(
+                "LLM edit response includes unsupported top-level keys: " + ", ".join(unknown_top_level) + "."
+            )
+
+        summary = payload.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise NeedsHumanError("LLM edit response must include a non-empty summary.")
+
+        edits = payload.get("edits")
+        if not isinstance(edits, list) or not edits:
+            raise NeedsHumanError("LLM edit response must include a non-empty edits list.")
+        if len(edits) > self.max_edit_actions:
+            raise NeedsHumanError(
+                f"LLM edit response exceeds AGENT_MAX_EDIT_ACTIONS ({len(edits)} > {self.max_edit_actions})."
+            )
+
+        validated_edits = [self._validate_edit_spec(edit, index) for index, edit in enumerate(edits, start=1)]
+        return {"summary": summary.strip(), "edits": validated_edits}
 
     async def _plan_changes(self, session: AgentSession, issue_data: Dict[str, Any]) -> str:
         work_dir = Path(session.working_dir)
@@ -400,7 +497,7 @@ class AgentOrchestrator:
             f"Snippets:\n{chr(10).join(snippets[:8])}"
         )
         response_text = await self._call_llm(system_prompt, user_prompt)
-        parsed = self._extract_json_object(response_text)
+        parsed = self._validate_plan_response(self._extract_json_object(response_text, "LLM plan response"))
         return parsed.get("summary", "Implement requested issue changes")
 
     def _validate_rel_path(self, rel_path: str) -> str:
@@ -452,7 +549,7 @@ class AgentOrchestrator:
     ) -> Dict[str, Any]:
         system_prompt = (
             "You generate minimal code edits. Return JSON only with keys: "
-            "summary, edits, quality_commands. "
+            "summary, edits. "
             "Each edit item: {path, action, content/find/replace}. "
             "Allowed actions: overwrite, append, replace."
         )
@@ -481,7 +578,8 @@ class AgentOrchestrator:
             "Return minimal edits to satisfy the issue."
         )
         response_text = await self._call_llm(system_prompt, user_prompt)
-        return self._extract_json_object(response_text)
+        payload = self._extract_json_object(response_text, "LLM edit response")
+        return self._validate_edit_response(payload)
 
     async def _implement_changes(self, session: AgentSession, plan: str, issue_data: Dict[str, Any]) -> List[str]:
         work_dir = Path(session.working_dir)
@@ -490,14 +588,10 @@ class AgentOrchestrator:
         file_snippets = {path: self._read_file_snippet(work_dir, path, max_lines=120) for path in candidates[:12]}
 
         llm_edits = await self._request_edits_from_llm(issue_data, plan, candidates, file_snippets)
-        edits = llm_edits.get("edits", [])
-        if not isinstance(edits, list) or not edits:
-            raise Exception("LLM produced no edits.")
+        edits = llm_edits["edits"]
 
         touched = []
         for edit in edits:
-            if not isinstance(edit, dict):
-                continue
             touched_path = self._apply_edit(work_dir, edit)
             touched.append(touched_path)
 
