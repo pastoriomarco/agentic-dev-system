@@ -9,6 +9,7 @@ This document is provided to the coding agent at runtime.
 - Push branch changes to the configured GitHub repository.
 - Open pull requests for issue tasks on the configured repository.
 - Update the existing branch and comment on the existing PR for supported same-repo PR tasks.
+- For supported fork PR tasks, push a helper branch to the base repo, open a helper PR there, and comment back on the source PR.
 
 ## What the agent cannot do
 

@@ -174,6 +174,25 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
             "head_ref": "feature/fix-null",
             "head_sha": "abc123def4567890",
             "base_repo_full_name": "pastoriomarco/agentic-dev-system",
+            "base_repo_clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git",
+            "base_ref": "main",
+            "base_sha": "def456abc1237890",
+        }
+
+    def _fork_pr_context(self, pr_number: int) -> dict:
+        return {
+            "number": pr_number,
+            "title": "Improve null handling from fork",
+            "body": "Original fork PR body",
+            "html_url": f"https://github.com/pastoriomarco/agentic-dev-system/pull/{pr_number}",
+            "same_repo": False,
+            "maintainer_can_modify": False,
+            "head_repo_full_name": "external-contrib/agentic-dev-system",
+            "head_repo_clone_url": "https://github.com/external-contrib/agentic-dev-system.git",
+            "head_ref": "feature/fix-null",
+            "head_sha": "feedface12345678",
+            "base_repo_full_name": "pastoriomarco/agentic-dev-system",
+            "base_repo_clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git",
             "base_ref": "main",
             "base_sha": "def456abc1237890",
         }
@@ -433,6 +452,36 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["subject_kind"], "pull_request")
         self.assertEqual(task["pr"]["head_ref"], "feature/fix-null")
         self.assertEqual(task["comment"]["comment_id"], 501)
+
+    async def test_fork_pull_request_issue_comment_creates_helper_pr_task(self):
+        async def fake_fetch_pr_context(_repo_full_name: str, pr_number: int) -> dict:
+            return self._fork_pr_context(pr_number)
+
+        wh._fetch_pull_request_context = fake_fetch_pr_context
+        payload_obj = {
+            "action": "created",
+            "repository": {"full_name": "pastoriomarco/agentic-dev-system", "clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git"},
+            "sender": {"login": "tester"},
+            "issue": {
+                "number": 10,
+                "title": "Improve null handling",
+                "body": "",
+                "pull_request": {"url": "https://api.github.com/repos/pastoriomarco/agentic-dev-system/pulls/10"},
+            },
+            "comment": {"id": 551, "body": "@agent please fix the fork PR", "html_url": "https://github.com/example/comment/551"},
+        }
+        payload = json.dumps(payload_obj).encode("utf-8")
+        headers = self._signed_headers(payload, "delivery-pr-fork-comment", event="issue_comment")
+
+        async with httpx.AsyncClient(app=wh.app, base_url="http://test") as client:
+            response = await client.post("/webhook/github", content=payload, headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        task = await wh.load_task("delivery-pr-fork-comment")
+        self.assertIsNotNone(task)
+        self.assertFalse(task["pr"]["same_repo"])
+        self.assertEqual(task["repo_clone_url"], "https://github.com/pastoriomarco/agentic-dev-system.git")
+        self.assertEqual(task["pr"]["head_repo_clone_url"], "https://github.com/external-contrib/agentic-dev-system.git")
 
     async def test_pull_request_review_comment_without_trigger_is_ignored(self):
         async def fake_fetch_pr_context(_repo_full_name: str, pr_number: int) -> dict:

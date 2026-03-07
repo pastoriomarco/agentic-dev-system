@@ -108,13 +108,22 @@ class AgentOrchestrator:
         except Exception:
             return "Failed to read permissions file. Follow configured policy checks and quality gates."
 
-    def _authenticated_repo_url(self) -> str:
+    def _authenticated_url(self, repo_url: str) -> str:
         if not self.github_token:
-            return self.repo_url
-        if self.repo_url.startswith("https://github.com/"):
-            suffix = self.repo_url[len("https://github.com/") :]
+            return repo_url
+        if repo_url.startswith("https://github.com/"):
+            suffix = repo_url[len("https://github.com/") :]
             return f"https://x-access-token:{self.github_token}@github.com/{suffix}"
-        return self.repo_url
+        return repo_url
+
+    def _authenticated_repo_url(self) -> str:
+        return self._authenticated_url(self.repo_url)
+
+    def _repo_parts_from_full_name(self, full_name: str) -> tuple[str, str]:
+        parts = [part.strip() for part in full_name.split("/") if part.strip()]
+        if len(parts) != 2:
+            raise Exception(f"Unable to parse owner/repo from full name: {full_name}")
+        return parts[0], parts[1]
 
     def _owner_repo(self) -> tuple[str, str]:
         parsed = urlparse(self.repo_url)
@@ -125,6 +134,40 @@ class AgentOrchestrator:
         if len(parts) < 2:
             raise Exception(f"Unable to parse owner/repo from URL: {self.repo_url}")
         return parts[0], parts[1]
+
+    def _target_owner_repo(self, issue_data: Dict[str, Any]) -> tuple[str, str]:
+        if issue_data.get("subject_kind") == "pull_request":
+            pr = issue_data.get("pr") or {}
+            base_full_name = pr.get("base_repo_full_name", "")
+            if base_full_name:
+                return self._repo_parts_from_full_name(base_full_name)
+        return self._owner_repo()
+
+    def _sanitize_branch_component(self, value: str, max_length: int = 24) -> str:
+        cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-._").lower()
+        if not cleaned:
+            cleaned = "task"
+        return cleaned[:max_length]
+
+    def _helper_branch_name(self, issue_data: Dict[str, Any]) -> str:
+        pr = issue_data.get("pr") or {}
+        pr_number = pr.get("number", issue_data.get("issue_number", "pr"))
+        task_token = self._sanitize_branch_component(issue_data.get("task_id", "task"), max_length=16)
+        return f"agent/pr-{pr_number}-{task_token}"
+
+    def _pull_request_push_branch(self, issue_data: Dict[str, Any]) -> str:
+        pr = issue_data.get("pr") or {}
+        if pr.get("same_repo"):
+            branch_name = pr.get("head_ref", "")
+            if not branch_name:
+                raise NeedsHumanError("Pull request head branch is missing.")
+            return branch_name
+        return self._helper_branch_name(issue_data)
+
+    def _pull_request_head_fetch_url(self, issue_data: Dict[str, Any]) -> str:
+        pr = issue_data.get("pr") or {}
+        head_clone_url = pr.get("head_repo_clone_url") or self.repo_url
+        return self._authenticated_url(head_clone_url)
 
     def _log(self, session: AgentSession, message: str):
         timestamp = datetime.utcnow().isoformat()
@@ -214,7 +257,13 @@ class AgentOrchestrator:
                 self._log(session, "Nothing to commit after checks.")
                 return session
 
-            publish_action = "Updating pull request" if issue_data.get("subject_kind") == "pull_request" else "Creating pull request"
+            publish_action = "Creating pull request"
+            if issue_data.get("subject_kind") == "pull_request":
+                publish_action = (
+                    "Updating pull request"
+                    if (issue_data.get("pr") or {}).get("same_repo")
+                    else "Creating helper pull request"
+                )
             self._log(session, publish_action)
             pr_result = await self._publish_changes(session, plan, issue_data)
             session.status = "completed"
@@ -245,8 +294,6 @@ class AgentOrchestrator:
         clone_url = self._authenticated_repo_url()
         if issue_data.get("subject_kind") == "pull_request":
             pr = issue_data.get("pr") or {}
-            if not pr.get("same_repo"):
-                raise NeedsHumanError("Pull request comes from a forked repository; same-repo PRs only are supported.")
             head_ref = pr.get("head_ref", "")
             head_sha = pr.get("head_sha", "")
             base_ref = pr.get("base_ref", "")
@@ -256,8 +303,18 @@ class AgentOrchestrator:
             result = self._run(["git", "clone", "--no-checkout", clone_url, "."], cwd=str(work_dir), timeout=300)
             if result.returncode != 0:
                 raise Exception(f"Git clone failed: {result.stderr}")
-            self._run(["git", "fetch", "--depth", "1", "origin", head_ref], cwd=str(work_dir), timeout=120, check=True)
-            self._run(["git", "checkout", "-B", head_ref, "FETCH_HEAD"], cwd=str(work_dir), timeout=120, check=True)
+            if pr.get("same_repo"):
+                local_branch = head_ref
+                self._run(["git", "fetch", "--depth", "1", "origin", head_ref], cwd=str(work_dir), timeout=120, check=True)
+            else:
+                local_branch = self._helper_branch_name(issue_data)
+                self._run(
+                    ["git", "fetch", "--depth", "1", self._pull_request_head_fetch_url(issue_data), head_ref],
+                    cwd=str(work_dir),
+                    timeout=120,
+                    check=True,
+                )
+            self._run(["git", "checkout", "-B", local_branch, "FETCH_HEAD"], cwd=str(work_dir), timeout=120, check=True)
             self._run(["git", "fetch", "--depth", "1", "origin", base_ref], cwd=str(work_dir), timeout=120, check=True)
             current_sha = self._current_head_sha(str(work_dir))
             if current_sha != head_sha:
@@ -803,8 +860,9 @@ class AgentOrchestrator:
         expected_head_sha = pr.get("head_sha", "")
         if not head_ref or not expected_head_sha:
             raise NeedsHumanError("Pull request head context is incomplete; cannot validate branch freshness.")
+        fetch_target = self._push_url() if pr.get("same_repo") else self._pull_request_head_fetch_url(issue_data)
         fetch_result = self._run(
-            ["git", "fetch", "--depth", "1", self._push_url(), head_ref],
+            ["git", "fetch", "--depth", "1", fetch_target, head_ref],
             cwd=work_dir,
             timeout=120,
         )
@@ -821,11 +879,11 @@ class AgentOrchestrator:
         self._run(["git", "config", "user.email", "agent@github.local"], cwd=work_dir, check=True)
         self._run(["git", "config", "user.name", "AI Agent"], cwd=work_dir, check=True)
         if issue_data.get("subject_kind") == "pull_request":
-            pr = issue_data.get("pr") or {}
-            branch_name = pr.get("head_ref", "")
-            if not branch_name:
-                raise NeedsHumanError("Pull request head branch is missing.")
-            checkout = self._run(["git", "checkout", branch_name], cwd=work_dir)
+            branch_name = self._pull_request_push_branch(issue_data)
+            checkout_cmd = ["git", "checkout", branch_name]
+            if not (issue_data.get("pr") or {}).get("same_repo"):
+                checkout_cmd = ["git", "checkout", "-B", branch_name]
+            checkout = self._run(checkout_cmd, cwd=work_dir)
             if checkout.returncode != 0:
                 raise Exception(f"Git checkout failed: {checkout.stderr}")
         else:
@@ -848,7 +906,12 @@ class AgentOrchestrator:
 
         if issue_data.get("subject_kind") == "pull_request":
             self._ensure_pull_request_head_unchanged(work_dir, issue_data)
-            push = self._run(["git", "push", self._push_url(), f"HEAD:{branch_name}"], cwd=work_dir, env=self._subprocess_env(include_write_token=True))
+            push_target = f"HEAD:{branch_name}" if (issue_data.get("pr") or {}).get("same_repo") else f"HEAD:refs/heads/{branch_name}"
+            push = self._run(
+                ["git", "push", self._push_url(), push_target],
+                cwd=work_dir,
+                env=self._subprocess_env(include_write_token=True),
+            )
         else:
             push = self._run(
                 ["git", "push", self._push_url(), f"HEAD:refs/heads/{branch_name}"],
@@ -879,7 +942,7 @@ Generated by AI Developer Agent
 """
         if not self.github_token:
             raise Exception("GITHUB_TOKEN is required to create pull requests.")
-        owner, repo = self._owner_repo()
+        owner, repo = self._target_owner_repo(issue_data)
         gh_url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
         headers = {
             "Authorization": f"token {self.github_token}",
@@ -898,19 +961,25 @@ Generated by AI Developer Agent
             pr_info = response.json()
             return {"number": pr_info.get("number"), "url": pr_info.get("html_url")}
 
+    async def _post_issue_comment(self, owner: str, repo: str, issue_number: int, body: str) -> None:
+        if not self.github_token:
+            raise Exception("GITHUB_TOKEN is required to publish pull request updates.")
+        url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
+        headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=headers, json={"body": body})
+        if response.status_code not in (200, 201):
+            print(f"Warning: failed posting comment on {owner}/{repo}#{issue_number}: {response.status_code} {response.text[:200]}")
+
     async def _comment_on_pull_request(self, issue_data: Dict[str, Any], plan: str, changed_files: List[str]) -> Dict[str, Any]:
         pr = issue_data.get("pr") or {}
         pr_number = pr.get("number")
         if not pr_number:
             raise NeedsHumanError("Pull request number missing; cannot publish update.")
-        if not self.github_token:
-            raise Exception("GITHUB_TOKEN is required to publish pull request updates.")
-        owner, repo = self._owner_repo()
-        url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
-        headers = {
-            "Authorization": f"token {self.github_token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
+        owner, repo = self._target_owner_repo(issue_data)
         changed_blob = "\n".join(f"- `{path}`" for path in changed_files[:15]) or "- no tracked file changes"
         body = (
             f"AI agent updated this pull request branch.\n\n"
@@ -918,13 +987,73 @@ Generated by AI Developer Agent
             f"Summary:\n{plan}\n\n"
             f"Changed files:\n{changed_blob}"
         )
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, headers=headers, json={"body": body})
-            if response.status_code not in (200, 201):
-                print(f"Warning: failed to comment on pull request #{pr_number}: {response.status_code} {response.text[:200]}")
+        await self._post_issue_comment(owner, repo, pr_number, body)
         return {"number": pr_number, "url": pr.get("html_url")}
+
+    async def _create_helper_pull_request(self, issue_data: Dict[str, Any], plan: str, changed_files: List[str]) -> Dict[str, Any]:
+        pr = issue_data.get("pr") or {}
+        source_pr_number = pr.get("number")
+        base_ref = pr.get("base_ref", "")
+        if not source_pr_number or not base_ref:
+            raise NeedsHumanError("Fork pull request context is incomplete; cannot create helper pull request.")
+        if not self.github_token:
+            raise Exception("GITHUB_TOKEN is required to create helper pull requests.")
+        owner, repo = self._target_owner_repo(issue_data)
+        gh_url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+        headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        branch_name = self._pull_request_push_branch(issue_data)
+        changed_blob = "\n".join(f"- `{path}`" for path in changed_files[:15]) or "- no tracked file changes"
+        pr_title = f"Agent follow-up for PR #{source_pr_number}: {pr.get('title', issue_data.get('title', ''))[:120]}"
+        pr_body = (
+            f"Follow-up changes for source PR #{source_pr_number}: {pr.get('html_url', '')}\n\n"
+            f"Task: `{issue_data.get('task_id', '')}`\n\n"
+            f"Summary:\n{plan}\n\n"
+            f"Changed files:\n{changed_blob}\n\n"
+            "This helper PR exists because the source pull request comes from a fork, and the agent does not push directly to contributor branches."
+        )
+        pr_data = {
+            "title": pr_title,
+            "body": pr_body,
+            "head": branch_name,
+            "base": base_ref,
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(gh_url, headers=headers, json=pr_data)
+        if response.status_code != 201:
+            raise Exception(f"Failed to create helper PR: {response.text}")
+        pr_info = response.json()
+        return {"number": pr_info.get("number"), "url": pr_info.get("html_url")}
+
+    async def _comment_on_fork_source_pull_request(
+        self,
+        issue_data: Dict[str, Any],
+        helper_pr: Dict[str, Any],
+        plan: str,
+        changed_files: List[str],
+    ) -> None:
+        pr = issue_data.get("pr") or {}
+        pr_number = pr.get("number")
+        if not pr_number:
+            raise NeedsHumanError("Source pull request number missing; cannot publish helper PR link.")
+        owner, repo = self._target_owner_repo(issue_data)
+        changed_blob = "\n".join(f"- `{path}`" for path in changed_files[:15]) or "- no tracked file changes"
+        body = (
+            "AI agent prepared a helper pull request instead of pushing to this branch directly because the source PR comes from a fork.\n\n"
+            f"Task: `{issue_data.get('task_id', '')}`\n"
+            f"Helper PR: {helper_pr.get('url', '')}\n\n"
+            f"Summary:\n{plan}\n\n"
+            f"Changed files:\n{changed_blob}"
+        )
+        await self._post_issue_comment(owner, repo, pr_number, body)
 
     async def _publish_changes(self, session: AgentSession, plan: str, issue_data: Dict[str, Any]) -> Dict[str, Any]:
         if issue_data.get("subject_kind") == "pull_request":
+            if not (issue_data.get("pr") or {}).get("same_repo"):
+                helper_pr = await self._create_helper_pull_request(issue_data, plan, session.changed_files)
+                await self._comment_on_fork_source_pull_request(issue_data, helper_pr, plan, session.changed_files)
+                return helper_pr
             return await self._comment_on_pull_request(issue_data, plan, session.changed_files)
         return await self._create_pull_request(session, plan, issue_data)

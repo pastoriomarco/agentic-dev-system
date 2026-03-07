@@ -14,8 +14,8 @@ This file defines how agents must operate in this repository workflow.
 2. Produce a short implementation plan.
 3. Make minimal, focused changes.
 4. Run available tests/lint for affected code.
-5. Commit on branch `agent/<issue_number>` for issue tasks, or on the approved PR head branch for PR tasks.
-6. Open a PR for issue tasks, or update the existing PR branch and comment summary for PR tasks.
+5. Commit on branch `agent/<issue_number>` for issue tasks, on the approved PR head branch for same-repo PR tasks, or on a helper branch for forked PR tasks.
+6. Open a PR for issue tasks, update the existing branch for same-repo PR tasks, or publish a helper PR for forked PR tasks.
 
 ## Safety Rules
 

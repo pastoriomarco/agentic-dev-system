@@ -68,9 +68,10 @@ In target repository settings:
 - Oversize webhook bodies are rejected with `413 payload_too_large`; fixed-window ingress throttling returns `429 rate_limited`.
 - Public LLM hosts must be in `LLM_HOST_ALLOWLIST` and reachable through the Squid `allowed_domains` proxy path; private/local LLM hosts must also be present in `WORKER_NO_PROXY`.
 - If `LLM_API_URL` uses `host.docker.internal`, set `WORKER_ENABLE_HOST_GATEWAY=true`; worker host-gateway exposure is otherwise disabled by default.
-- Same-repo PR issue comments create a task only when they contain an explicit `@agent` or `@ai` trigger.
-- Same-repo PR review comments and submitted review bodies also create tasks only with an explicit `@agent` or `@ai` trigger.
+- PR issue comments create a task only when they contain an explicit `@agent` or `@ai` trigger.
+- PR review comments and submitted review bodies also create tasks only with an explicit `@agent` or `@ai` trigger.
 - Review-comment tasks are additionally scoped to the commented file and persisted with file/line context.
+- Fork PR tasks are accepted too, but they publish follow-up helper PRs in the base repo instead of pushing to contributor branches.
 
 ## API usage
 
@@ -205,8 +206,8 @@ Queue key format:
 
 ## Current limitations
 
-- PR-aware execution is still intentionally narrow: only same-repo PR issue comments, review comments, and submitted review bodies with explicit `@agent` or `@ai` triggers are supported.
-- Forked PRs are still not supported yet.
+- PR-aware execution is still intentionally narrow: PR issue comments, review comments, and submitted review bodies must contain explicit `@agent` or `@ai` triggers.
+- Forked PR tasks do not update the contributor branch directly; they publish a helper PR in the base repo and comment back on the source PR.
 - Review-comment tasks must stay within the commented file; broader multi-file refactors from a review comment should be routed through human review instead.
 - LLM-generated edits can still fail on complex repos or ambiguous requirements; add repository-specific prompts/rules to improve reliability.
 - Domain-level allowlisting cannot guarantee single-repo access by itself; enforce single-repo scope with GitHub App/fine-grained token permissions.

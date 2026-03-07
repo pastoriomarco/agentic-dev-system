@@ -1288,7 +1288,7 @@ def _build_pull_request_task(
         "status": "queued",
         "sender": sender,
         "repo_full_name": repo_full_name,
-        "repo_clone_url": pr_context.get("head_repo_clone_url") or repo_clone_url,
+        "repo_clone_url": pr_context.get("base_repo_clone_url") or repo_clone_url,
         "created_at": created_at,
         "updated_at": created_at,
         "attempt_count": 0,
@@ -1336,6 +1336,7 @@ async def _fetch_pull_request_context(repo_full_name: str, pr_number: int) -> Di
         "head_ref": pr_data.get("head", {}).get("ref", ""),
         "head_sha": pr_data.get("head", {}).get("sha", ""),
         "base_repo_full_name": base_full_name,
+        "base_repo_clone_url": base_repo.get("clone_url") or build_repo_url(base_full_name),
         "base_ref": pr_data.get("base", {}).get("ref", ""),
         "base_sha": pr_data.get("base", {}).get("sha", ""),
     }
@@ -1416,8 +1417,6 @@ async def build_task_from_event(
             if not _text_has_pr_agent_trigger(body):
                 return None, "pull_request_comment_without_agent_trigger"
             pr_context = await _fetch_pull_request_context(repo_full_name, issue_number)
-            if not pr_context.get("same_repo"):
-                return None, "fork_pull_request_not_supported"
             if not pr_context.get("head_ref") or not pr_context.get("head_sha") or not pr_context.get("base_ref"):
                 return None, "pull_request_context_incomplete"
             queue_key = build_queue_key(repo_full_name, issue_number)
@@ -1454,8 +1453,6 @@ async def build_task_from_event(
         if not _text_has_pr_agent_trigger(body):
             return None, "pull_request_review_comment_without_agent_trigger"
         pr_context = await _fetch_pull_request_context(repo_full_name, issue_number)
-        if not pr_context.get("same_repo"):
-            return None, "fork_pull_request_not_supported"
         if not pr_context.get("head_ref") or not pr_context.get("head_sha") or not pr_context.get("base_ref"):
             return None, "pull_request_context_incomplete"
         if not comment.get("path") or (
@@ -1502,8 +1499,6 @@ async def build_task_from_event(
         if not _text_has_pr_agent_trigger(body):
             return None, "pull_request_review_without_agent_trigger"
         pr_context = await _fetch_pull_request_context(repo_full_name, issue_number)
-        if not pr_context.get("same_repo"):
-            return None, "fork_pull_request_not_supported"
         if not pr_context.get("head_ref") or not pr_context.get("head_sha") or not pr_context.get("base_ref"):
             return None, "pull_request_context_incomplete"
         queue_key = build_queue_key(repo_full_name, issue_number)
