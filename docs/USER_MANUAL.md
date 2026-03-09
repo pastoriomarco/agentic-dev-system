@@ -46,7 +46,7 @@ Recommended:
 From repository root:
 
 ```bash
-cd /home/tndlux/workspaces/isaac_ros-dev/src/agentic-dev-system
+cd /path/to/agentic-dev-system
 cp .env.example .env
 ```
 
@@ -56,6 +56,10 @@ Set required values in `.env`:
 - `GITHUB_TOKEN`
 - `GITHUB_OWNER` and `GITHUB_REPO` (or explicit `ALLOWED_REPOS`)
 - `ADMIN_API_TOKEN` (required in production)
+
+For a first local test, use a throwaway repository and a dedicated low-scope token. Keep `DEPLOYMENT_ENV=development` unless you are explicitly validating production startup behavior.
+
+If you do not yet have a reachable LLM endpoint, you can still validate container build, health checks, webhook ingress, queueing, and approval API behavior. Do not approve tasks for execution until `LLM_API_URL` points to a real reachable endpoint.
 
 Start stack:
 
@@ -69,6 +73,13 @@ Basic checks:
 curl http://localhost:8000/health
 curl http://localhost:8000/health/deep
 ```
+
+Recommended local-first `.env` profile:
+
+- Set `ALLOWED_REPOS=<your-user>/<your-throwaway-repo>` explicitly.
+- Set `GITHUB_STATUS_LABELS_ENABLED=false` and `GITHUB_STATUS_COMMENTS_ENABLED=false` if you want to validate queueing/API behavior before writing labels or comments back to GitHub.
+- Leave `DEEP_HEALTH_CHECK_LLM=false` unless you intentionally want startup health to probe the LLM endpoint.
+- If you are using a host-local LLM via `host.docker.internal`, keep `WORKER_ENABLE_HOST_GATEWAY=true`, `LLM_HOST_ALLOWLIST=host.docker.internal`, and include `host.docker.internal` in `WORKER_NO_PROXY`.
 
 ## 4. Configuration Reference
 
@@ -173,6 +184,7 @@ Important behavior:
 - LLM edit responses may contain only `summary` and `edits`.
 - Invalid or policy-violating LLM output is escalated to `needs_human` before any file edit is applied.
 - LLM endpoint network policy is enforced both at startup and inside the worker before outbound LLM requests.
+- The stock worker image includes `pytest` and `ruff`, so the default `.env.example` value for `AGENT_QUALITY_COMMANDS` works without extra image changes.
 
 ## 5. GitHub Webhook Setup
 
@@ -373,7 +385,7 @@ Check:
 - Event type/action is in supported matrix.
 - Duplicate delivery IDs are not being replayed.
 - Pull request issue comments include `@agent` or `@ai`.
-- Pull request is same-repo and still has valid head/base metadata.
+- Pull request still has valid head/base metadata; fork PRs are supported only through helper-PR publish mode.
 
 ### 10.2 Approval API returns 401
 
@@ -428,12 +440,58 @@ Use this as minimum baseline:
 
 ## 12. Testing and Validation
 
-Run unit/integration tests in containerized environment:
+### 12.1 Containerized regression tests
+
+Run the bundled test suite in the same containerized environment used by the service:
 
 ```bash
 docker build -t agentic-dev-system:latest .
 docker run --rm agentic-dev-system:latest python -m unittest discover -s tests -v
 ```
+
+### 12.2 Local stack smoke test
+
+This validates build/startup, ingress handling, queue state, and admin APIs before you try a real agent run.
+
+1. Copy `.env.example` to `.env`.
+2. Set `GITHUB_WEBHOOK_SECRET`, `ADMIN_API_TOKEN`, and explicit `ALLOWED_REPOS`.
+3. If you are only smoke-testing queueing and APIs, it is fine to leave `DEEP_HEALTH_CHECK_LLM=false` and skip task approvals.
+4. Start the stack with `docker-compose up -d --build`.
+5. Verify `curl http://localhost:8000/health` and `curl http://localhost:8000/health/deep`.
+6. Post a signed local webhook directly to the service:
+
+```bash
+PAYLOAD='{"action":"opened","issue":{"number":101,"title":"Local test issue","body":"Do not approve unless repo+LLM are configured."},"repository":{"full_name":"<owner>/<repo>","clone_url":"https://github.com/<owner>/<repo>.git"},"sender":{"login":"local-tester"}}'
+SIG=$(printf %s "$PAYLOAD" | openssl dgst -sha256 -hmac "$GITHUB_WEBHOOK_SECRET" | sed 's/^.* //')
+
+curl -X POST http://localhost:8000/webhook/github \
+  -H "Content-Type: application/json" \
+  -H "X-GitHub-Event: issues" \
+  -H "X-GitHub-Delivery: local-test-issue-101" \
+  -H "X-Hub-Signature-256: sha256=$SIG" \
+  -d "$PAYLOAD"
+```
+
+7. Confirm the task appears in `curl http://localhost:8000/api/issues`.
+8. Confirm `curl http://localhost:8000/api/tasks` contains the immutable task record.
+9. If you do not yet have a real reachable `LLM_API_URL`, stop here. The ingress, queueing, and approval surface are now validated without risking a failed worker run.
+
+### 12.3 End-to-end throwaway-repo test
+
+Use this only after the smoke test passes.
+
+1. Use a throwaway repository that your `GITHUB_TOKEN` can clone, push to, and open PRs against.
+2. Set `GITHUB_OWNER`, `GITHUB_REPO`, or `ALLOWED_REPOS` to that repo only.
+3. Configure a real reachable `LLM_API_URL`.
+4. If the LLM is host-local, use `host.docker.internal`, keep `WORKER_ENABLE_HOST_GATEWAY=true`, and ensure `LLM_HOST_ALLOWLIST` and `WORKER_NO_PROXY` match that route.
+5. Keep the default `AGENT_QUALITY_COMMANDS` unless the target repo needs a different quality gate.
+6. Start the stack and confirm `/health/deep` is healthy enough for your intended route.
+7. Create a real issue in the throwaway repo or deliver a signed local `issues.opened` webhook that points at that repo.
+8. Approve the queued task with `/api/issues/<queue_key>/approve`.
+9. Watch `docker-compose logs -f webhook` and inspect `/api/sessions`.
+10. Confirm the run either opens a PR or lands in `needs_human` with an actionable reason.
+
+### 12.4 Webhook ingress/manual behavior checks
 
 Validate webhook ingress controls manually:
 
