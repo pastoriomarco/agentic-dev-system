@@ -44,6 +44,7 @@ Edit `.env` with real values:
 - `GITHUB_STATUS_*` and `GH_LABEL_*` for default GitHub-side ownership signaling
 - `REDIS_URL` (defaults to local compose Redis)
 - `ALLOWED_REPOS` (recommended for multi-repo safety)
+- `ALLOWED_TRIGGER_USERS` and/or `ALLOWED_AUTHOR_ASSOCIATIONS` for sender-level webhook gating
 - `MAX_RETRIES`, `RETRY_BASE_DELAY_SECONDS`, `RETRY_MAX_DELAY_SECONDS`, `RETRY_POLL_INTERVAL_SECONDS`
 - `WORKER_*` limits and runtime controls (CPU/memory/pids/timeout/image/network, `WORKER_RUN_AS_UID`, `WORKER_RUN_AS_GID`, `WORKER_ENABLE_HOST_GATEWAY`)
 - `LLM_API_URL`, `LLM_MODEL`, `LLM_HOST_ALLOWLIST`
@@ -72,6 +73,7 @@ In target repository settings:
 - PR review comments and submitted review bodies also create tasks only with an explicit `@agent` or `@ai` trigger.
 - Review-comment tasks are additionally scoped to the commented file and persisted with file/line context.
 - Fork PR tasks are accepted too, but they publish follow-up helper PRs in the base repo instead of pushing to contributor branches.
+- Task-creating events can also be restricted by GitHub login (`ALLOWED_TRIGGER_USERS`) and/or webhook `author_association` (`ALLOWED_AUTHOR_ASSOCIATIONS`, for example `OWNER,MEMBER,COLLABORATOR`).
 
 ## API usage
 
@@ -165,6 +167,9 @@ Queue key format:
 - Each webhook delivery is stored as its own task record keyed by `X-GitHub-Delivery`; the queue API exposes the current task projection per issue/PR number.
 - Webhooks are accepted only from allowlisted repos.
 : If `ALLOWED_REPOS` is empty, the service defaults to allowlisting `GITHUB_OWNER/GITHUB_REPO` when set.
+- Task creation can be further restricted to specific GitHub logins and/or trusted GitHub author associations.
+: If `ALLOWED_TRIGGER_USERS` is set, the webhook `sender.login` must match.
+: If `ALLOWED_AUTHOR_ASSOCIATIONS` is set, the event author's GitHub `author_association` must match.
 - In `production`, startup fails if `GITHUB_WEBHOOK_SECRET` is empty; unsigned webhooks are rejected.
 - In `production`, startup also fails if `ADMIN_API_TOKEN` is empty.
 - Webhook delivery IDs (`X-GitHub-Delivery`) are deduplicated in Redis to prevent replay/duplicate processing.
@@ -195,6 +200,8 @@ Queue key format:
 - Restrict approval API access at network layer and set `ADMIN_API_TOKEN`.
 - Set `ALLOWED_REPOS` explicitly in production.
 : Example: `ALLOWED_REPOS=pastoriomarco/agentic-dev-system,pastoriomarco/private-repo`
+- For public repos, set `ALLOWED_AUTHOR_ASSOCIATIONS=OWNER,MEMBER,COLLABORATOR` unless you intentionally want outside contributors to enqueue work.
+- If you want only named maintainers or bots to trigger work, set `ALLOWED_TRIGGER_USERS=<login1>,<login2>`.
 - Set `DEPLOYMENT_ENV=production` in deployed environments so signature checks fail closed on misconfiguration.
 - This design requires Docker socket access by the webhook service.
 : Treat that host as privileged infrastructure and isolate it from untrusted multi-tenant workloads.

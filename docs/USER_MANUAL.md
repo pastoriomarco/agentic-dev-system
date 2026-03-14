@@ -55,6 +55,7 @@ Set required values in `.env`:
 - `GITHUB_WEBHOOK_SECRET`
 - `GITHUB_TOKEN`
 - `GITHUB_OWNER` and `GITHUB_REPO` (or explicit `ALLOWED_REPOS`)
+- `ALLOWED_TRIGGER_USERS` and/or `ALLOWED_AUTHOR_ASSOCIATIONS` if you need sender-level gating
 - `ADMIN_API_TOKEN` (required in production)
 
 For a first local test, use a throwaway repository and a dedicated low-scope token. Keep `DEPLOYMENT_ENV=development` unless you are explicitly validating production startup behavior.
@@ -77,6 +78,7 @@ curl http://localhost:8000/health/deep
 Recommended local-first `.env` profile:
 
 - Set `ALLOWED_REPOS=<your-user>/<your-throwaway-repo>` explicitly.
+- For a public repo, set `ALLOWED_AUTHOR_ASSOCIATIONS=OWNER,MEMBER,COLLABORATOR` before exposing the webhook.
 - Set `GITHUB_STATUS_LABELS_ENABLED=false` and `GITHUB_STATUS_COMMENTS_ENABLED=false` if you want to validate queueing/API behavior before writing labels or comments back to GitHub.
 - Leave `DEEP_HEALTH_CHECK_LLM=false` unless you intentionally want startup health to probe the LLM endpoint.
 - If you are using a host-local LLM via `host.docker.internal`, keep `WORKER_ENABLE_HOST_GATEWAY=true`, `LLM_HOST_ALLOWLIST=host.docker.internal`, and include `host.docker.internal` in `WORKER_NO_PROXY`.
@@ -106,6 +108,8 @@ Important behavior:
 
 - `GITHUB_OWNER`, `GITHUB_REPO`: fallback single-repo allowlist if `ALLOWED_REPOS` is empty.
 - `ALLOWED_REPOS`: comma-separated `owner/repo` allowlist.
+- `ALLOWED_TRIGGER_USERS`: comma-separated GitHub logins allowed to create tasks from webhook events.
+- `ALLOWED_AUTHOR_ASSOCIATIONS`: comma-separated GitHub `author_association` values allowed to create tasks (for example `OWNER,MEMBER,COLLABORATOR`).
 - `GITHUB_TOKEN`: token used for GitHub API operations and clone/push. The worker only exposes write credentials during publish/comment steps; quality gates run without write-token subprocess environment.
 - `LLM_API_URL`: worker LLM endpoint URL.
 - `LLM_HOST_ALLOWLIST`: comma-separated exact hosts or dot-prefixed suffixes allowed for `LLM_API_URL`.
@@ -115,6 +119,10 @@ Allowlist behavior:
 - If `ALLOWED_REPOS` is set: only listed repos are accepted.
 - If `ALLOWED_REPOS` is empty and `GITHUB_OWNER/GITHUB_REPO` are set: only that repo is accepted.
 - If none are set: all repos are accepted (not recommended).
+- If `ALLOWED_TRIGGER_USERS` is set: the webhook `sender.login` must be listed for task-creating events.
+- If `ALLOWED_AUTHOR_ASSOCIATIONS` is set: the webhook object's `author_association` must be listed for task-creating events.
+- If both sender-level controls are set: both checks must pass.
+- `pull_request.synchronize` is still accepted even when sender-level controls are set because it only marks existing PR tasks stale; it does not enqueue new work.
 
 ### 4.3 Approval/API protection
 
@@ -212,7 +220,7 @@ Supported actions:
 
 Important limitations:
 
-- `issue_comment` on an issue thread is always eligible for queueing under the normal trigger rules.
+- `issue_comment` on an issue thread is eligible for queueing under the normal trigger rules unless sender-level allowlists block it.
 - `issue_comment` on a pull request creates a task only when the comment contains `@agent` or `@ai`.
 - `pull_request_review_comment` creates a task only when the review comment contains `@agent` or `@ai` and includes file/line context.
 - `pull_request_review` with action `submitted` creates a task only when the review body contains `@agent` or `@ai`.

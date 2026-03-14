@@ -86,6 +86,8 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         self.orig_redis_client = wh.redis_client
         self.orig_github_token = wh.GITHUB_TOKEN
         self.orig_fetch_pr_context = wh._fetch_pull_request_context
+        self.orig_allowed_trigger_users = wh.ALLOWED_TRIGGER_USERS
+        self.orig_allowed_author_associations = wh.ALLOWED_AUTHOR_ASSOCIATIONS
         self.orig_webhook_max_body_bytes = wh.WEBHOOK_MAX_BODY_BYTES
         self.orig_rate_limit_window_seconds = wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS
         self.orig_rate_limit_global_max = wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX
@@ -104,6 +106,8 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         wh.RUNTIME_ENV = "production"
         wh.ADMIN_API_TOKEN = "admin-token"
         wh.GITHUB_TOKEN = ""
+        wh.ALLOWED_TRIGGER_USERS = set()
+        wh.ALLOWED_AUTHOR_ASSOCIATIONS = set()
         wh.WEBHOOK_MAX_BODY_BYTES = 262144
         wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = 60
         wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX = 120
@@ -126,6 +130,8 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         wh.redis_client = self.orig_redis_client
         wh.GITHUB_TOKEN = self.orig_github_token
         wh._fetch_pull_request_context = self.orig_fetch_pr_context
+        wh.ALLOWED_TRIGGER_USERS = self.orig_allowed_trigger_users
+        wh.ALLOWED_AUTHOR_ASSOCIATIONS = self.orig_allowed_author_associations
         wh.WEBHOOK_MAX_BODY_BYTES = self.orig_webhook_max_body_bytes
         wh.WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = self.orig_rate_limit_window_seconds
         wh.WEBHOOK_RATE_LIMIT_GLOBAL_MAX = self.orig_rate_limit_global_max
@@ -399,6 +405,81 @@ class WebhookIngressControlsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(await wh.load_task("delivery-repo-1"))
         self.assertIsNone(await wh.load_task("delivery-repo-2"))
         self.assertIsNone(await wh.load_issue("pastoriomarco:agentic-dev-system:32"))
+
+    async def test_sender_allowlist_accepts_authorized_user(self):
+        wh.ALLOWED_TRIGGER_USERS = {"trusted-maintainer"}
+        payload_obj = {
+            "action": "opened",
+            "repository": {"full_name": "pastoriomarco/agentic-dev-system", "clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git"},
+            "sender": {"login": "trusted-maintainer"},
+            "issue": {
+                "number": 33,
+                "title": "Add safety check",
+                "body": "Please implement this",
+                "author_association": "OWNER",
+            },
+        }
+        payload = json.dumps(payload_obj).encode("utf-8")
+        headers = self._signed_headers(payload, "delivery-allowed-sender")
+
+        async with httpx.AsyncClient(app=wh.app, base_url="http://test") as client:
+            response = await client.post("/webhook/github", content=payload, headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(await wh.load_task("delivery-allowed-sender"))
+
+    async def test_sender_allowlist_rejects_unauthorized_user(self):
+        wh.ALLOWED_TRIGGER_USERS = {"trusted-maintainer"}
+        payload_obj = {
+            "action": "opened",
+            "repository": {"full_name": "pastoriomarco/agentic-dev-system", "clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git"},
+            "sender": {"login": "tester"},
+            "issue": {
+                "number": 34,
+                "title": "Add safety check",
+                "body": "Please implement this",
+                "author_association": "OWNER",
+            },
+        }
+        payload = json.dumps(payload_obj).encode("utf-8")
+        headers = self._signed_headers(payload, "delivery-blocked-sender")
+
+        async with httpx.AsyncClient(app=wh.app, base_url="http://test") as client:
+            response = await client.post("/webhook/github", content=payload, headers=headers)
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["reason"], "sender_not_allowlisted")
+        self.assertIsNone(await wh.load_task("delivery-blocked-sender"))
+        self.assertIsNone(await wh.load_issue("pastoriomarco:agentic-dev-system:34"))
+
+    async def test_author_association_allowlist_rejects_untrusted_commenter(self):
+        wh.ALLOWED_AUTHOR_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+        payload_obj = {
+            "action": "created",
+            "repository": {"full_name": "pastoriomarco/agentic-dev-system", "clone_url": "https://github.com/pastoriomarco/agentic-dev-system.git"},
+            "sender": {"login": "external-user"},
+            "issue": {
+                "number": 35,
+                "title": "Issue thread",
+                "body": "",
+                "author_association": "OWNER",
+            },
+            "comment": {
+                "id": 701,
+                "body": "please take a look",
+                "author_association": "NONE",
+            },
+        }
+        payload = json.dumps(payload_obj).encode("utf-8")
+        headers = self._signed_headers(payload, "delivery-blocked-association", event="issue_comment")
+
+        async with httpx.AsyncClient(app=wh.app, base_url="http://test") as client:
+            response = await client.post("/webhook/github", content=payload, headers=headers)
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["reason"], "author_association_not_allowlisted")
+        self.assertIsNone(await wh.load_task("delivery-blocked-association"))
+        self.assertIsNone(await wh.load_issue("pastoriomarco:agentic-dev-system:35"))
 
     async def test_pull_request_issue_comment_without_trigger_is_ignored(self):
         payload_obj = {

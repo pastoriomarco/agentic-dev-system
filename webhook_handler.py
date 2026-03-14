@@ -47,6 +47,8 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
 ALLOWED_REPOS_RAW = os.environ.get("ALLOWED_REPOS", "").strip()
+ALLOWED_TRIGGER_USERS_RAW = os.environ.get("ALLOWED_TRIGGER_USERS", "").strip()
+ALLOWED_AUTHOR_ASSOCIATIONS_RAW = os.environ.get("ALLOWED_AUTHOR_ASSOCIATIONS", "").strip()
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 RETRY_BASE_DELAY_SECONDS = int(os.environ.get("RETRY_BASE_DELAY_SECONDS", "60"))
 RETRY_MAX_DELAY_SECONDS = int(os.environ.get("RETRY_MAX_DELAY_SECONDS", "1800"))
@@ -182,15 +184,56 @@ def parse_allowlist(raw_value: str) -> set[str]:
     return {entry for entry in entries if entry}
 
 
+def parse_upper_allowlist(raw_value: str) -> set[str]:
+    entries = [item.strip().upper() for item in raw_value.split(",")]
+    return {entry for entry in entries if entry}
+
+
 ALLOWLIST = parse_allowlist(ALLOWED_REPOS_RAW)
 if not ALLOWLIST and GITHUB_OWNER and GITHUB_REPO:
     ALLOWLIST = {f"{GITHUB_OWNER.lower()}/{GITHUB_REPO.lower()}"}
+ALLOWED_TRIGGER_USERS = parse_allowlist(ALLOWED_TRIGGER_USERS_RAW)
+ALLOWED_AUTHOR_ASSOCIATIONS = parse_upper_allowlist(ALLOWED_AUTHOR_ASSOCIATIONS_RAW)
 
 
 def is_repo_allowed(repo_full_name: str) -> bool:
     if not ALLOWLIST:
         return True
     return repo_full_name.lower() in ALLOWLIST
+
+
+def _event_sender_login(payload: Dict[str, Any]) -> str:
+    sender = payload.get("sender", {}) or {}
+    return (sender.get("login") or "").strip().lower()
+
+
+def _event_author_association(event_type: str, payload: Dict[str, Any]) -> str:
+    if event_type == "issues":
+        subject = payload.get("issue", {}) or {}
+        return (subject.get("author_association") or "").strip().upper()
+    if event_type == "issue_comment":
+        comment = payload.get("comment", {}) or {}
+        issue = payload.get("issue", {}) or {}
+        return (comment.get("author_association") or issue.get("author_association") or "").strip().upper()
+    if event_type == "pull_request_review_comment":
+        comment = payload.get("comment", {}) or {}
+        return (comment.get("author_association") or "").strip().upper()
+    if event_type == "pull_request_review":
+        review = payload.get("review", {}) or {}
+        return (review.get("author_association") or "").strip().upper()
+    return ""
+
+
+def webhook_trigger_is_authorized(event_type: str, payload: Dict[str, Any]) -> tuple[bool, str | None]:
+    sender_login = _event_sender_login(payload)
+    if ALLOWED_TRIGGER_USERS and sender_login not in ALLOWED_TRIGGER_USERS:
+        return False, "sender_not_allowlisted"
+
+    author_association = _event_author_association(event_type, payload)
+    if ALLOWED_AUTHOR_ASSOCIATIONS and author_association not in ALLOWED_AUTHOR_ASSOCIATIONS:
+        return False, "author_association_not_allowlisted"
+
+    return True, None
 
 
 def build_queue_key(repo_full_name: str, issue_number: int) -> str:
@@ -1801,6 +1844,13 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                 "delivery_id": delivery_id,
                 "stale_task_count": stale_count,
             }
+        )
+
+    authorized, authorization_reason = webhook_trigger_is_authorized(github_event, payload)
+    if not authorized:
+        return JSONResponse(
+            {"status": "ignored", "reason": authorization_reason, "delivery_id": delivery_id},
+            status_code=202,
         )
 
     task, ignore_reason = await build_task_from_event(github_event, payload, action, delivery_id)
